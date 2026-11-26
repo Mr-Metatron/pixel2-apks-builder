@@ -1,0 +1,74 @@
+# The group tag is just to easily find this APKBUILD by some scripts for automation
+# group=kde-other
+maintainer="Bart Ribbers <bribbers@disroot.org>"
+pkgname=plasma-camera
+pkgver=2.1.1
+pkgrel=12
+pkgdesc="Camera application for Plasma Mobile"
+# armhf blocked by qt6-qtdeclarative
+arch="all !armhf"
+# Alpine v3.24 recipe d38e00a5d2447d175671e621baf01f92f94b25f2.
+url="https://invent.kde.org/plasma-mobile/plasma-camera"
+license="GPL-3.0-or-later AND BSD-3-Clause"
+depends="
+	gst-plugins-bad
+	gst-plugins-good
+	kirigami
+	kirigami-addons
+	libcamera
+	qt6-qtmultimedia
+	qt6-qtsensors
+	"
+makedepends="
+	extra-cmake-modules
+	kcoreaddons-dev
+	ki18n-dev
+	kio-dev
+	kirigami-dev
+	libcamera-dev
+	libkexiv2-dev
+	qt6-qtbase-dev
+	qt6-qtdeclarative-dev
+	qt6-qtmultimedia-dev
+	qt6-qtsensors-dev
+	qt6-qtsvg-dev
+	samurai
+	"
+checkdepends="appstream"
+subpackages="$pkgname-lang"
+source="https://download.kde.org/stable/plasma-camera/plasma-camera-$pkgver.tar.xz
+	0001-trigger-single-autofocus-from-the-Plasma-camera.patch
+	0002-control-the-rear-optical-stabilizer-while-previewing.patch
+	0003-select-a-strobe-illuminated-frame-at-the-photo-shutter.patch
+	0004-use-the-installed-camera-desktop-id.patch
+	0005-pause-viewfinder-and-open-previews-once.patch
+	0006-expose-camera-exposure-value-slider.patch
+	0007-tap-viewfinder-to-focus.patch
+	"
+
+build() {
+	cmake -B build -G Ninja \
+		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
+		-DCMAKE_INSTALL_PREFIX=/usr \
+		-DCMAKE_INSTALL_LIBDIR=lib
+	cmake --build build
+}
+
+check() {
+	ctest --test-dir build
+}
+
+package() {
+	DESTDIR="$pkgdir" cmake --install build
+}
+
+sha512sums="
+0a7a6e4bcce5fcb483291e15bca3a4537a4f00a8b7ab4fbd3f38e775ec8757a4b99e4fd4124435e734f865a167a61e836945520005c4058bc41757216e8a325f  plasma-camera-2.1.1.tar.xz
+93b9bc2fdf6d872e82e6eaad85d2c70f5902d4240d9b4e21cdae364d7941e38cf8b6e13e59d15a45b6592125cc5c4cfe1f72d67bbb18446baba4a1342ee18d27  0001-trigger-single-autofocus-from-the-Plasma-camera.patch
+981f216b8a9947f69bdfe6d7b64d66aaa2f959980d1399ab761bad83d5dc3c655d0c82c73d93a6eb3d2ab1d3979acda8c8f4e34d30f97edf9a7855158921685b  0002-control-the-rear-optical-stabilizer-while-previewing.patch
+f742f6686b86a8308bce8bf3795f8e37b6e200a2d3ea0c77a9cbcfb14181a07345bc4f4de54d99e8f61d9ce1aafe7c398452f29647a6579c84131228328d262f  0003-select-a-strobe-illuminated-frame-at-the-photo-shutter.patch
+fa4977915b52b21c09d18a35788f36d8f100b1ba2a9cdc541271cf484b8b9a1132489513c2b891e25cac9cc17f6e5aaeb568c921eaec72f1a1abefab12b6d2f4  0004-use-the-installed-camera-desktop-id.patch
+cfa994270e40e8e8b8bf5d350f426c31d23e1627f3b91c0dc9fb40ef2f5deb873fa19b11aba280c66bed79f0348c744ec75d980b081abc3c0bbdbabe5d84647e  0005-pause-viewfinder-and-open-previews-once.patch
+fd9002f6fef36cba5c5b578358d1bd52b67ac27c23ad834608dbc463f8f56623b997f9e83d11c511e37a0100661ba726bd69768ae13434ae383cf6933e7ac3f5  0006-expose-camera-exposure-value-slider.patch
+142376b809242146d05f7bcd784b9468daa6b792d96c081e95c98afe1f77da5812f189ea741c59a1f6338d41d4eaf6e2170b8b691ed467dc6242f990f49642da  0007-tap-viewfinder-to-focus.patch
+"

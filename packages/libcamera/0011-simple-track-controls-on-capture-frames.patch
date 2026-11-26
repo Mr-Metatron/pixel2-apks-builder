@@ -1,0 +1,99 @@
+Subject: [PATCH] simple: associate software ISP statistics with capture frames
+
+MSM8998 CAMSS has no subdevice frame-start events. Writing controls at
+asynchronous stats completion and indexing them by request sequence loses
+track of free-running captures. Schedule the latest update on each capture
+completion and latch its history for the exact buffer passed to the IPA.
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 55b404d..f065e67 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -202,6 +202,7 @@ struct SimpleFrameInfo {
+ 	Request *request;
+ 	bool metadataRequired;
+ 	bool metadataProcessed;
++	ControlList sensorControls;
+ };
+ 
+ class SimpleFrames
+@@ -352,6 +353,7 @@ public:
+ 	std::map<PixelFormat, std::vector<const Configuration *>> formats_;
+ 
+ 	std::unique_ptr<DelayedControls> delayedCtrls_;
++	ControlList pendingSensorControls_;
+ 
+ 	std::vector<std::unique_ptr<FrameBuffer>> conversionBuffers_;
+ 	struct RequestOutputs {
+@@ -899,6 +901,16 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ {
+ 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
+ 
++	/* Without SOF events schedule writes for the next capture at completion,
++	 * including errored captures and buffers without application requests.
++	 */
++	if (swIsp_ && useConversion_ && !frameStartEmitter_ &&
++	    buffer->metadata().status != FrameMetadata::FrameCancelled) {
++		delayedCtrls_->push(pendingSensorControls_);
++		pendingSensorControls_.clear();
++		delayedCtrls_->applyControls(buffer->metadata().sequence + 1);
++	}
++
+ 	/*
+ 	 * If an error occurred during capture, or if the buffer was cancelled,
+ 	 * complete the request, even if the converter is in use as there's no
+@@ -963,6 +975,10 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 		auto &metadata = request->_d()->metadata();
+ 		const uint64_t timestamp = buffer->metadata().timestamp;
+ 		metadata.set(controls::SensorTimestamp, timestamp);
++		if (swIsp_ && useConversion_) {
++			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
++			info->sensorControls = delayedCtrls_->get(buffer->metadata().sequence);
++		}
+ 		if (useConversion_ && autofocus_) {
+ 			autofocus_->request(request->controls());
+ 			autofocus_->capture(timestamp, metadata);
+@@ -1063,8 +1079,7 @@ void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId,
+ 	if (autofocus_)
+ 		autofocus_->process(metadata);
+ 
+-	swIsp_->processStats(frame, bufferId,
+-			     delayedCtrls_->get(frame));
++	swIsp_->processStats(frame, bufferId, info->sensorControls);
+ }
+ 
+ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata)
+@@ -1080,19 +1095,10 @@ void SimpleCameraData::metadataReady(uint32_t frame, const ControlList &metadata
+ 
+ void SimpleCameraData::setSensorControls(const ControlList &sensorControls)
+ {
+-	delayedCtrls_->push(sensorControls);
+-	/*
+-	 * Directly apply controls now if there is no frameStart signal.
+-	 *
+-	 * \todo Applying controls directly not only increases the risk of
+-	 * applying them to the wrong frame (or across a frame boundary),
+-	 * but it also bypasses delayedCtrls_, creating AGC regulation issues.
+-	 * Both problems should be fixed.
+-	 */
+-	if (!frameStartEmitter_) {
+-		ControlList ctrls(sensorControls);
+-		sensor_->setControls(&ctrls);
+-	}
++	if (frameStartEmitter_)
++		delayedCtrls_->push(sensorControls);
++	else
++		pendingSensorControls_ = sensorControls;
+ }
+ 
+ /* Retrieve all source pads connected to a sink pad through active routes. */
+@@ -1709,6 +1715,9 @@ int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ 	video->bufferReady.connect(data, &SimpleCameraData::imageBufferReady);
+ 
+ 	data->delayedCtrls_->reset();
++	data->pendingSensorControls_.clear();
++	if (!frameStartEmitter && data->swIsp_ && data->useConversion_)
++		data->delayedCtrls_->applyControls(0);
+ 	if (frameStartEmitter) {
+ 		ret = frameStartEmitter->setFrameStartEnabled(true);
+ 		if (ret) {

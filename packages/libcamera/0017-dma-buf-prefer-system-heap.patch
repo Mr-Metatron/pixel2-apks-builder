@@ -1,0 +1,39 @@
+Subject: [PATCH] libcamera: prefer system dma-heap when contiguous pages are optional
+
+SoftISP and the virtual pipeline accept the system heap. Prefer it to
+avoid consuming the contiguous camera, display and firmware reserve.
+Callers specifying CMA alone still use their original allocator.
+
+Downstream for libcamera v0.7.1. Remove when upstream makes the same
+provider selection for SoftISP output.
+
+diff --git a/src/libcamera/dma_buf_allocator.cpp b/src/libcamera/dma_buf_allocator.cpp
+index d8c62dd..bfa8f53 100644
+--- a/src/libcamera/dma_buf_allocator.cpp
++++ b/src/libcamera/dma_buf_allocator.cpp
+@@ -41,13 +41,14 @@ struct DmaBufAllocatorInfo {
+ #endif
+ 
+ static constexpr std::array<DmaBufAllocatorInfo, 4> providerInfos = { {
++	/* Preserve CMA for callers that require physically contiguous pages. */
++	{ DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap, "/dev/dma_heap/system" },
+ 	/*
+ 	 * /dev/dma_heap/linux,cma is the CMA dma-heap. When the cma heap size is
+ 	 * specified on the kernel command line, this gets renamed to "reserved".
+ 	 */
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap, "/dev/dma_heap/linux,cma" },
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap, "/dev/dma_heap/reserved" },
+-	{ DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap, "/dev/dma_heap/system" },
+ 	{ DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf, "/dev/udmabuf" },
+ } };
+ 
+@@ -92,7 +93,8 @@ LOG_DEFINE_CATEGORY(DmaBufAllocator)
+  *
+  * Multiple types can be selected by combining type flags, in which case
+  * the constructed DmaBufAllocator will match one of the types. If multiple
+- * requested types can work on the system, which provider is used is undefined.
++ * requested types can work on the system, the system heap is preferred, then
++ * CMA, then udmabuf.
+  */
+ DmaBufAllocator::DmaBufAllocator(DmaBufAllocatorFlags type)
+ {

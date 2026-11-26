@@ -1,0 +1,116 @@
+Subject: [PATCH] camera: trigger a focus scan on a single viewfinder tap
+
+diff --git a/src/contents/ui/camera/CameraPage.qml b/src/contents/ui/camera/CameraPage.qml
+index c948398..4dd4f75 100644
+--- a/src/contents/ui/camera/CameraPage.qml
++++ b/src/contents/ui/camera/CameraPage.qml
+@@ -126,6 +126,16 @@ Kirigami.Page {
+         camera: root.camera
+         bottomMargin: controlContainer.height
+ 
++        FocusTapArea {
++            previewRect: viewfinder.contentRect
++            headerBottom: cameraExtraControls.height
++            footerTop: controlContainer.y
++            enabled: root.camera.available && !root.camera.busy
++                && root.camera.focusStatus !== PlasmaCamera.FocusUnavailable
++                && root.camera.focusStatus !== PlasmaCamera.Focusing
++            onFocusRequested: root.camera.startAutoFocus()
++        }
++
+         // Header controls
+         CameraExtraControls {
+             id: cameraExtraControls
+diff --git a/src/contents/ui/camera/FocusTapArea.qml b/src/contents/ui/camera/FocusTapArea.qml
+new file mode 100644
+index 0000000..ca61b4e
+--- /dev/null
++++ b/src/contents/ui/camera/FocusTapArea.qml
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++import QtQuick
++import org.kde.kirigami as Kirigami
++
++Item {
++    id: root
++    signal focusRequested()
++    required property rect previewRect
++    required property real headerBottom
++    required property real footerTop
++    x: previewRect.x
++    y: Math.max(previewRect.y, headerBottom)
++    width: previewRect.width
++    height: Math.max(0, Math.min(previewRect.y + previewRect.height, footerTop) - y)
++    clip: true
++
++    // PointHandlers take passive grabs and track different fingers. Cancel a
++    // pending tap even if its finger stays still while the other finger moves.
++    PointHandler { id: firstFinger; acceptedDevices: PointerDevice.TouchScreen }
++    PointHandler { id: secondFinger; acceptedDevices: PointerDevice.TouchScreen }
++    readonly property bool twoFingers: firstFinger.active && secondFinger.active
++    onTwoFingersChanged: if (twoFingers) tap.hadSecondFinger = true
++
++    TapHandler {
++        id: tap
++        property bool hadSecondFinger: false
++        gesturePolicy: TapHandler.DragThreshold
++        onPressedChanged: if (pressed) hadSecondFinger = root.twoFingers
++        onTapped: (eventPoint) => {
++            if (hadSecondFinger)
++                return
++            // Walleye meters its fixed focus window. The ring acknowledges the tap.
++            ring.x = eventPoint.position.x - ring.width / 2
++            ring.y = eventPoint.position.y - ring.height / 2
++            feedback.restart()
++            root.focusRequested()
++        }
++    }
++
++    Rectangle {
++        id: ring
++        width: Kirigami.Units.gridUnit * 2
++        height: width
++        radius: width / 2
++        color: "transparent"
++        border.color: "white"
++        border.width: 2
++        visible: feedback.running
++    }
++
++    Timer {
++        id: feedback
++        interval: 450
++    }
++}
+diff --git a/src/contents/ui/camera/Viewfinder.qml b/src/contents/ui/camera/Viewfinder.qml
+index 405c20e..a65e85e 100644
+--- a/src/contents/ui/camera/Viewfinder.qml
++++ b/src/contents/ui/camera/Viewfinder.qml
+@@ -19,6 +19,7 @@ Rectangle {
+     property real bottomMargin: 0
+ 
+     property alias videoSink: viewfinder.videoSink
++    readonly property rect contentRect: viewfinder.contentRect
+ 
+     color: "black"
+ 
+@@ -35,4 +36,4 @@ Rectangle {
+         width: parent.width
+         height: parent.height
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/resources.qrc b/src/resources.qrc
+index e1a8176..62372aa 100644
+--- a/src/resources.qrc
++++ b/src/resources.qrc
+@@ -12,6 +12,7 @@
+         <file alias="camera/CameraControls.qml">contents/ui/camera/CameraControls.qml</file>
+         <file alias="camera/CameraExtraControls.qml">contents/ui/camera/CameraExtraControls.qml</file>
+         <file alias="camera/CameraPage.qml">contents/ui/camera/CameraPage.qml</file>
++        <file alias="camera/FocusTapArea.qml">contents/ui/camera/FocusTapArea.qml</file>
+         <file alias="camera/CaptureButton.qml">contents/ui/camera/CaptureButton.qml</file>
+         <file alias="camera/CaptureController.qml">contents/ui/camera/CaptureController.qml</file>
+         <file alias="camera/PreviewArea.qml">contents/ui/camera/PreviewArea.qml</file>

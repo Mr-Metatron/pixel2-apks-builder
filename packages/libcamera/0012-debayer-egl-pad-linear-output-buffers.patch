@@ -1,0 +1,58 @@
+Subject: [PATCH] software_isp: pad linear EGL render targets for Adreno 5xx
+
+Freedreno reserves whole 32-row tiles at the end of a linear render
+target. Importing a dma-heap buffer checks pitch but cannot supply the
+missing rows. Reserve them when negotiating and allocating the output.
+Keep bytesused at the visible row count and reject a short ISP buffer
+before queuing any part of its request.
+
+Reference: Mesa 26.1.6, src/freedreno/fdl/fd5_layout.c
+
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -369,7 +369,9 @@
+ 	/* Align stride to 256 bytes as a generic GPU memory access alignment */
+ 	unsigned int stride = libcamera::utils::alignUp(size.width * config.bpp / 8, 256);
+ 
+-	return std::make_tuple(stride, stride * size.height);
++	/* Adreno 5xx can access whole 32-row tiles when resolving to a linear buffer. */
++	unsigned int storageHeight = utils::alignUp(size.height, 32);
++	return std::make_tuple(stride, stride * storageHeight);
+ }
+ 
+ void DebayerEGL::setShaderVariableValues(const DebayerParams &params)
+@@ -552,7 +554,7 @@
+ 
+ 	bench_.finishFrame();
+ 
+-	metadata.planes()[0].bytesused = output->planes()[0].length;
++	metadata.planes()[0].bytesused = outputConfig_.stride * outputSize_.height;
+ 
+ 	/* Calculate stats for the whole frame */
+ 	stats_->processFrame(frame, 0, input);
+
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1811,6 +1811,20 @@
+ 			return -EINVAL;
+ 	}
+ 
++	/* Check application-supplied ISP buffers before queuing any raw buffer. */
++	if (data->useConversion_ && data->swIsp_) {
++		for (const auto &[stream, buffer] : request->buffers()) {
++			if (stream == data->rawStream_)
++				continue;
++
++			if (buffer->planes().empty() ||
++			    buffer->planes()[0].length < stream->configuration().frameSize) {
++				LOG(SimplePipeline, Error) << "Software ISP output buffer is too small";
++				return -EINVAL;
++			}
++		}
++	}
++
+ 	for (auto &[stream, buffer] : request->buffers()) {
+ 		/*
+ 		 * If conversion is needed, push the buffer to the converter

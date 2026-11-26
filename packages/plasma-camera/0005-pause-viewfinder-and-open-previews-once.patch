@@ -1,0 +1,370 @@
+Subject: [PATCH] Stop the viewfinder in the background and open previews once
+
+Use the existing camera worker to release the camera when its window loses
+focus or hands off a saved preview. Keep in-flight captures and recordings
+running and remember the selected camera for the return to the viewfinder.
+
+Open the file in the preferred application with one KIO job. This keeps
+KDE activation and the MIME association without starting kde-open. Ignore
+further taps while the first launch waits to take focus.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 8f2339f..44c5495 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,6 +42,7 @@ find_package(Qt6 ${QT_MIN_VERSION} REQUIRED NO_MODULE COMPONENTS
+ 
+ if(NOT ANDROID)
+     find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Widgets)
++    find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS KIO)
+ endif()
+ 
+ find_package(KF6 ${KF_MIN_VERSION} REQUIRED COMPONENTS Kirigami CoreAddons I18n Config)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 7a577a3..aff130b 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -60,7 +60,7 @@ if(ANDROID)
+ 
+     ecm_add_android_apk(plasma-camera ANDROID_DIR ${CMAKE_SOURCE_DIR})
+ else()
+-    target_link_libraries(plasma-camera Qt::Widgets PkgConfig::LIBCAMERA)
++    target_link_libraries(plasma-camera Qt::Widgets KF6::KIOGui PkgConfig::LIBCAMERA)
+ endif()
+ 
+ target_include_directories(plasma-camera PRIVATE ${CMAKE_BINARY_DIR})
+diff --git a/src/contents/ui/camera/CameraPage.qml b/src/contents/ui/camera/CameraPage.qml
+index 134471a..c948398 100644
+--- a/src/contents/ui/camera/CameraPage.qml
++++ b/src/contents/ui/camera/CameraPage.qml
+@@ -101,7 +101,7 @@ Kirigami.Page {
+             icon.name: root.captureController.intendedIcon
+             onTriggered: root.captureController.requestCapture()
+ 
+-            enabled: !camera.busy
++            enabled: camera.available && !camera.busy
+                 && (root.captureMode !== CameraPage.CaptureMode.Photo || root.captureSession.readyForCapture)
+                 && !root.captureController.captureTimerRunning
+                 && !root.captureSession.isSavingVideo
+@@ -113,7 +113,7 @@ Kirigami.Page {
+             text: i18n("Switch Camera")
+             icon.color: "transparent"
+             icon.name: "camera-photo-symbolic"
+-            enabled: !root.camera.busy && root.camera.cameraDeviceIds.length > 1
++            enabled: root.camera.available && !root.camera.busy && root.camera.cameraDeviceIds.length > 1
+ 
+             onTriggered: root.camera.switchToNextCamera();
+         }
+diff --git a/src/contents/ui/camera/PreviewArea.qml b/src/contents/ui/camera/PreviewArea.qml
+index 8070691..bf21ce8 100644
+--- a/src/contents/ui/camera/PreviewArea.qml
++++ b/src/contents/ui/camera/PreviewArea.qml
+@@ -48,11 +48,12 @@ Item {
+ 
+     MouseArea {
+         anchors.fill: parent
++        enabled: showVideoPreview ? !preview.isSavingVideo : imagePreview.status === Image.Ready
+         onClicked: {
+             if (showVideoPreview)
+-                Qt.openUrlExternally(videoRecorder.actualLocation);
++                applicationWindow().openPreview(videoRecorder.actualLocation);
+             else
+-                Qt.openUrlExternally(preview.imageUrl);
++                applicationWindow().openPreview(preview.imageUrl);
+         }
+     }
+ 
+diff --git a/src/contents/ui/main.qml b/src/contents/ui/main.qml
+index 2b29017..fd92a30 100644
+--- a/src/contents/ui/main.qml
++++ b/src/contents/ui/main.qml
+@@ -4,6 +4,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ 
+ import QtQuick
++import QtQuick.Window
+ import QtQuick.Layouts
+ import QtQuick.Controls as Controls
+ import QtMultimedia
+@@ -19,6 +20,30 @@ Kirigami.ApplicationWindow {
+     minimumWidth: 350
+     title: i18n("Camera")
+ 
++    property bool initialized: false
++    property bool openingPreview: false
++    readonly property bool foreground: visible && visibility !== Window.Minimized
++        && active && Qt.application.state === Qt.ApplicationActive
++    readonly property bool captureInProgress: mainCamera.busy
++        || cameraPage.captureController.captureTimerRunning
++        || cameraPage.captureSession.isRecordingVideo
++        || cameraPage.captureSession.isSavingVideo
++    readonly property bool viewfinderWanted: initialized
++        && (captureInProgress || (foreground && !openingPreview))
++
++    onForegroundChanged: {
++        if (!foreground) {
++            openingPreview = false;
++        }
++    }
++    onViewfinderWantedChanged: {
++        if (viewfinderWanted) {
++            mainCamera.startCamera();
++        } else {
++            mainCamera.stopCamera();
++        }
++    }
++
+     pageStack.columnView.columnResizeMode: Kirigami.ColumnView.SingleColumn
+     pageStack.globalToolBar.style: Kirigami.ApplicationHeaderStyle.None
+     pageStack.initialPage: CameraPage {
+@@ -30,6 +55,21 @@ Kirigami.ApplicationWindow {
+         settingsDialog.open();
+     }
+ 
++    function openPreview(url: url) {
++        if (!foreground || openingPreview || captureInProgress || url.toString().length === 0) {
++            return;
++        }
++        openingPreview = true;
++        mainCamera.openPreview(url);
++    }
++
++    Timer {
++        // A viewer may open without taking focus. Restore the preview in that case.
++        interval: 10000
++        running: root.openingPreview
++        onTriggered: root.openingPreview = false
++    }
++
+     PlasmaCamera {
+         id: mainCamera
+ 
+@@ -39,8 +79,6 @@ Kirigami.ApplicationWindow {
+             if (cameraId.length > 0) {
+                 cameraDevice = cameraId;
+             }
+-            // Start camera
+-            mainCamera.startCamera();
+         }
+ 
+         // Returns which camera to select from settings, and nothing if the camera can't be found.
+@@ -72,6 +110,10 @@ Kirigami.ApplicationWindow {
+         onErrorOccurred: {
+             showPassiveNotification(i18n("An error occurred: \"%1\". Please consider restarting the application if it stopped working.", mainCamera.errorString));
+         }
++        onPreviewOpenFailed: reason => {
++            root.openingPreview = false;
++            root.showPassiveNotification(i18n("Could not open the preview: %1", reason));
++        }
+     }
+ 
+     SettingsDialog {
+@@ -79,5 +121,7 @@ Kirigami.ApplicationWindow {
+         camera: mainCamera
+         cameraManager: cameraPage.captureSession
+     }
++
++    Component.onCompleted: initialized = true
+ }
+ 
+diff --git a/src/plasmacamera.cpp b/src/plasmacamera.cpp
+index 36ff701..16059b5 100644
+--- a/src/plasmacamera.cpp
++++ b/src/plasmacamera.cpp
+@@ -10,6 +10,12 @@
+ 
+ #include "plasmacamera.h"
+ 
++#ifdef Q_OS_ANDROID
++#include <QDesktopServices>
++#else
++#include <KIO/OpenUrlJob>
++#endif
++
+ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
+ {
+     // Initialize camera manager
+@@ -51,6 +57,9 @@ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
+     connect(m_cameraWorker, &Worker::running, this, [this]() {
+         setState(State::Running);
+         setBusy(false);
++        if (m_stabilizationRequested) {
++            setStabilization(true);
++        }
+     });
+ 
+     // resend frames that we received from the camera worker
+@@ -126,6 +135,23 @@ void PlasmaCamera::stopCamera()
+     setActive(false);
+ }
+ 
++void PlasmaCamera::openPreview(const QUrl &url)
++{
++#ifdef Q_OS_ANDROID
++    if (!QDesktopServices::openUrl(url)) {
++        Q_EMIT previewOpenFailed(url.toDisplayString());
++    }
++#else
++    auto *job = new KIO::OpenUrlJob(url, this);
++    connect(job, &KJob::result, this, [this](KJob *result) {
++        if (result->error()) {
++            Q_EMIT previewOpenFailed(result->errorString());
++        }
++    });
++    job->start();
++#endif
++}
++
+ bool PlasmaCamera::switchToNextCamera()
+ {
+     if (m_state != State::Running) {
+@@ -230,6 +256,7 @@ void PlasmaCamera::setStabilizationState(bool available, bool enabled)
+ void PlasmaCamera::setStabilization(bool enabled)
+ {
+     if (isAvailable() && !busy() && m_stabilizationAvailable) {
++        m_stabilizationRequested = enabled;
+         QMetaObject::invokeMethod(m_cameraWorker, "setStabilization", Qt::QueuedConnection, Q_ARG(QString, m_cameraId), Q_ARG(bool, enabled));
+     }
+ }
+@@ -347,7 +374,7 @@ void PlasmaCamera::setActive(const bool active)
+             return;
+         }
+ 
+-        startCamera();
++        startCameraInternal();
+ 
+     } else {
+         // If we are currently not in Running, then wait until we setState to Running to stop the camera.
+@@ -355,7 +382,7 @@ void PlasmaCamera::setActive(const bool active)
+             return;
+         }
+ 
+-        stopCamera();
++        stopCameraInternal();
+     }
+ 
+     // If the state change request m_active cannot be handled right now,
+@@ -388,8 +415,11 @@ void PlasmaCamera::setCameraDevice(const QString &cameraDeviceId)
+ 
+     qDebug() << "Using camera: " << cameraDeviceId;
+     m_cameraId = cameraDeviceId;
++    m_stabilizationRequested = false;
+ 
+-    startCameraInternal();
++    if (m_active && (m_state == State::Ready || m_state == State::Running)) {
++        startCameraInternal();
++    }
+ }
+ 
+ void PlasmaCamera::setCameraFormat(const QCameraFormat &cameraFormat)
+@@ -524,7 +554,7 @@ void PlasmaCamera::handleCameraAdded(std::shared_ptr<libcamera::Camera> camera)
+     Q_EMIT cameraDeviceListChanged();
+ 
+     // Start the camera if we don't have any, but it was requested
+-    if (!m_camera && m_active) {
++    if (!m_camera && m_active && m_state == State::Ready) {
+         startCameraInternal();
+     }
+ }
+@@ -534,13 +564,13 @@ void PlasmaCamera::handleCameraRemoved(std::shared_ptr<libcamera::Camera> camera
+     Q_EMIT cameraDeviceListChanged();
+ 
+     // If this is our current camera, disable it
++    if (camera->id() == m_cameraId.toStdString()) {
++        m_cameraId.clear();
++        m_stabilizationRequested = false;
++    }
++
+     if (m_camera == camera) {
+         stopCameraInternal();
+-
+-        // Start the next camera (if it exists)
+-        if (m_active) {
+-            startCameraInternal();
+-        }
+     }
+ }
+ 
+@@ -597,11 +627,10 @@ void PlasmaCamera::stopCameraInternal()
+     setFocusStatus(FocusUnavailable);
+ 
+     // Clear the current camera
+-    m_cameraId.clear();
+     m_camera.reset();
+ 
+     // After the camera is stopped, the worker will set this state to Ready
+-    QMetaObject::invokeMethod(m_cameraWorker, "unsetCamera", Qt::BlockingQueuedConnection);
++    QMetaObject::invokeMethod(m_cameraWorker, "unsetCamera", Qt::QueuedConnection);
+ }
+ 
+ void PlasmaCamera::setState(const State state)
+@@ -626,6 +655,10 @@ void PlasmaCamera::setState(const State state)
+         break;
+ 
+     case State::Running:
++        // A camera switch may have queued this signal before the stop request.
++        if (previousState == State::Stopping) {
++            return;
++        }
+         m_state = State::Running;
+         if (!m_active) {
+             stopCameraInternal();
+diff --git a/src/plasmacamera.h b/src/plasmacamera.h
+index d87abf8..28e483e 100644
+--- a/src/plasmacamera.h
++++ b/src/plasmacamera.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <QUrl>
++
+ #include <plasmacamera/settings.h>
+ 
+ #include "plasmacamera/worker.h"
+@@ -19,8 +21,6 @@
+  * TODO: image rotation
+  * TODO: Raw mode
+  * TODO: video mode
+- * TODO: stop and pause methods
+- *
+  * TODO: dealing with changing camera in settings
+  *
+  * TODO: instead of plasmacamera calling for updates in capabilities or ... worker should take initiative to report this stuff
+@@ -122,6 +122,8 @@ public:
+      */
+     Q_INVOKABLE void stopCamera();
+ 
++    Q_INVOKABLE void openPreview(const QUrl &url);
++
+     /*!
+      * Returns all camera devices as a list of ids.
+      */
+@@ -212,6 +214,7 @@ Q_SIGNALS:
+     void stabilizationChanged();
+     void photoFlashChanged();
+     void captureFailed(const QString &reason);
++    void previewOpenFailed(const QString &reason);
+ 
+     // Settings
+     void settingsChanged(const Settings &settings);
+@@ -314,6 +317,7 @@ private:
+     FocusStatus m_focusStatus = FocusUnavailable;
+     bool m_stabilizationAvailable = false;
+     bool m_stabilizationEnabled = false;
++    bool m_stabilizationRequested = false;
+     void setPhotoFlashAvailable(bool available);
+     bool m_photoFlashAvailable = false;
+     bool m_photoFlashEnabled = false;
+diff --git a/src/plasmacamera/worker.cpp b/src/plasmacamera/worker.cpp
+index 659fe21..061bcdf 100644
+--- a/src/plasmacamera/worker.cpp
++++ b/src/plasmacamera/worker.cpp
+@@ -539,6 +539,7 @@ void Worker::stopViewFinder()
+     if (m_allocator) {
+         m_allocator->free(m_stream);
+         delete m_allocator;
++        m_allocator = nullptr;
+     }
+ 
+     m_mappedBuffers.clear();

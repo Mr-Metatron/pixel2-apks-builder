@@ -1,0 +1,85 @@
+Subject: [PATCH] ipa: simple: support mode-specific colour matrices
+
+Walleye IMX362 stock full and binned modes have different matrices for
+the same light. Keep the existing ccms table as the default and select
+an optional override by the raw sensor output size at configure time.
+
+diff --git a/src/ipa/simple/algorithms/ccm.cpp b/src/ipa/simple/algorithms/ccm.cpp
+index ace9c35..525f182 100644
+--- a/src/ipa/simple/algorithms/ccm.cpp
++++ b/src/ipa/simple/algorithms/ccm.cpp
+@@ -36,11 +36,33 @@ int Ccm::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
+ 		return ret;
+ 	}
+ 
++	if (tuningData.contains("modes")) {
++		const auto &modes = tuningData["modes"];
++		if (!modes.isList())
++			return -EINVAL;
++		for (const auto &mode : modes.asList()) {
++			auto size = mode["sensorSize"].get<Size>();
++			if (!size || modeTables_.count(*size))
++				return -EINVAL;
++			ret = modeTables_[*size].readYaml(mode["ccms"], "ct", "ccm");
++			if (ret)
++				return ret;
++		}
++	}
++
+ 	context.ccmEnabled = true;
+ 
+ 	return 0;
+ }
+ 
++int Ccm::configure([[maybe_unused]] IPAContext &context, const IPAConfigInfo &configInfo)
++{
++	auto it = modeTables_.find(configInfo.sensorInfo.outputSize);
++	activeTable_ = it == modeTables_.end() ? &ccm_ : &it->second;
++	currentCcm_.reset();
++	return 0;
++}
++
+ void Ccm::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+ 		  IPAFrameContext &frameContext, [[maybe_unused]] DebayerParams *params)
+ {
+@@ -49,7 +71,7 @@ void Ccm::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
+ 	/* Change CCM only on bigger temperature changes. */
+ 	if (!currentCcm_ ||
+ 	    utils::abs_diff(ct, lastCt_) >= kTemperatureThreshold) {
+-		currentCcm_ = ccm_.getInterpolated(ct);
++		currentCcm_ = activeTable_->getInterpolated(ct);
+ 		lastCt_ = ct;
+ 	}
+ 
+diff --git a/src/ipa/simple/algorithms/ccm.h b/src/ipa/simple/algorithms/ccm.h
+index b20a7da..89daa55 100644
+--- a/src/ipa/simple/algorithms/ccm.h
++++ b/src/ipa/simple/algorithms/ccm.h
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <map>
+ #include <optional>
+ 
+ #include "libcamera/internal/matrix.h"
+@@ -26,6 +27,7 @@ public:
+ 	~Ccm() = default;
+ 
+ 	int init(IPAContext &context, const ValueNode &tuningData) override;
++	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+ 		     IPAFrameContext &frameContext,
+@@ -37,7 +39,10 @@ public:
+ 
+ private:
+ 	unsigned int lastCt_;
+-	Interpolator<Matrix<float, 3, 3>> ccm_;
++	using Table = Interpolator<Matrix<float, 3, 3>>;
++	Table ccm_;
++	std::map<Size, Table> modeTables_;
++	Table *activeTable_ = &ccm_;
+ 	std::optional<Matrix<float, 3, 3>> currentCcm_;
+ };
+ 

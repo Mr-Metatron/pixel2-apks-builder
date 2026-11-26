@@ -1,0 +1,167 @@
+Subject: [PATCH] simple: use Walleye front preview and active mode line timing
+
+Select stock IMX179 res2 for Viewfinder. Read the active line timing at
+configure so ExposureTime metadata uses the selected mode. Both stock
+sensor descriptors specify a 2-frame pipeline and 1.4 um cells; IMX179
+defers the gain write by one frame relative to exposure. HBLANK is fixed.
+
+diff --git a/include/libcamera/ipa/soft.mojom b/include/libcamera/ipa/soft.mojom
+index 77328c5..ecc7e0d 100644
+--- a/include/libcamera/ipa/soft.mojom
++++ b/include/libcamera/ipa/soft.mojom
+@@ -9,6 +9,7 @@ module ipa.soft;
+ import "include/libcamera/ipa/core.mojom";
+ 
+ struct IPAConfigInfo {
++	libcamera.IPACameraSensorInfo sensorInfo;
+ 	libcamera.ControlInfoMap sensorControls;
+ };
+ 
+@@ -16,7 +17,6 @@ interface IPASoftInterface {
+ 	init(libcamera.IPASettings settings,
+ 	     libcamera.SharedFD fdStats,
+ 	     libcamera.SharedFD fdParams,
+-	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+ 	start() => (int32 ret);
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 34f7403..8487330 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -87,7 +87,6 @@ struct IPAContext {
+ 	{
+ 	}
+ 
+-	IPACameraSensorInfo sensorInfo;
+ 	IPASessionConfiguration configuration;
+ 	IPAActiveState activeState;
+ 	FCQueue<IPAFrameContext> frameContexts;
+diff --git a/src/ipa/simple/soft_simple.cpp b/src/ipa/simple/soft_simple.cpp
+index 629e1a3..7ec758b 100644
+--- a/src/ipa/simple/soft_simple.cpp
++++ b/src/ipa/simple/soft_simple.cpp
+@@ -54,7 +54,6 @@ public:
+ 	int init(const IPASettings &settings,
+ 		 const SharedFD &fdStats,
+ 		 const SharedFD &fdParams,
+-		 const IPACameraSensorInfo &sensorInfo,
+ 		 const ControlInfoMap &sensorControls,
+ 		 ControlInfoMap *ipaControls,
+ 		 bool *ccmEnabled) override;
+@@ -94,7 +93,6 @@ IPASoftSimple::~IPASoftSimple()
+ int IPASoftSimple::init(const IPASettings &settings,
+ 			const SharedFD &fdStats,
+ 			const SharedFD &fdParams,
+-			const IPACameraSensorInfo &sensorInfo,
+ 			const ControlInfoMap &sensorControls,
+ 			ControlInfoMap *ipaControls,
+ 			bool *ccmEnabled)
+@@ -106,8 +104,6 @@ int IPASoftSimple::init(const IPASettings &settings,
+ 			<< settings.sensorModel;
+ 	}
+ 
+-	context_.sensorInfo = sensorInfo;
+-
+ 	/* Load the tuning data file */
+ 	File file(settings.configurationFile);
+ 	if (!file.open(File::OpenModeFlag::ReadOnly)) {
+@@ -212,7 +208,7 @@ int IPASoftSimple::configure(const IPAConfigInfo &configInfo)
+ 	context_.frameContexts.clear();
+ 
+ 	context_.configuration.agc.lineDuration =
+-		context_.sensorInfo.minLineLength * 1.0s / context_.sensorInfo.pixelRate;
++		configInfo.sensorInfo.minLineLength * 1.0s / configInfo.sensorInfo.pixelRate;
+ 	context_.configuration.agc.exposureMin = exposureInfo.min().get<int32_t>();
+ 	context_.configuration.agc.exposureMax = exposureInfo.max().get<int32_t>();
+ 	if (!context_.configuration.agc.exposureMin) {
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 8b7dcb7..55b404d 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1526,12 +1526,12 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, Span<const StreamRo
+ 		cfg.pixelFormat = formats.begin()->first;
+ 		cfg.size = formats.begin()->second[0].max;
+ 
+-		/* Use the full field of view of the binned IMX362 mode, including
+-		 * the debayer's border allowance in the processed size.
+-		 */
+-		if (role == StreamRole::Viewfinder && data->sensor_->model() == "imx362") {
++		/* Use the processed size, which accounts for the debayer border. */
++		const std::string &model = data->sensor_->model();
++		if (role == StreamRole::Viewfinder && (model == "imx179" || model == "imx362")) {
++			const Size binned = model == "imx179" ? Size(1640, 922) : Size(2016, 1512);
+ 			for (const auto *pipe : data->formats_.at(cfg.pixelFormat)) {
+-				if (pipe->sensorSize == Size(2016, 1512)) {
++				if (pipe->sensorSize == binned) {
+ 					cfg.size = pipe->outputSizes.max;
+ 					break;
+ 				}
+@@ -1641,6 +1641,9 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 		return data->converter_->configure(inputCfg, outputCfgs);
+ 	} else {
+ 		ipa::soft::IPAConfigInfo configInfo;
++		ret = data->sensor_->sensorInfo(&configInfo.sensorInfo);
++		if (ret)
++			return ret;
+ 		configInfo.sensorControls = data->sensor_->controls();
+ 		return data->swIsp_->configure(inputCfg, outputCfgs, configInfo);
+ 	}
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 1ab920a..d821750 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -186,7 +186,12 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 		{ "imx179", {
+ 			.unitCellSize = { 1400, 1400 },
+ 			.testPatternModes = { },
+-			.sensorDelays = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 1,
++				.vblankDelay = 2,
++				.hblankDelay = 0
++			},
+ 		} },
+ 		{ "imx214", {
+ 			.unitCellSize = { 1120, 1120 },
+@@ -266,6 +271,16 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			.testPatternModes = {},
+ 			.sensorDelays = { },
+ 		} },
++		{ "imx362", {
++			.unitCellSize = { 1400, 1400 },
++			.testPatternModes = { },
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 0
++			},
++		} },
+ 		{ "imx415", {
+ 			.unitCellSize = { 1450, 1450 },
+ 			.testPatternModes = {},
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index 0d20428..27b2b7c 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -142,17 +142,9 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, CameraSensor *sensor,
+ 	std::string ipaTuningFile =
+ 		ipa_->configurationFile(sensor->model() + ".yaml", "uncalibrated.yaml");
+ 
+-	IPACameraSensorInfo sensorInfo{};
+-	int ret = sensor->sensorInfo(&sensorInfo);
+-	if (ret) {
+-		LOG(SoftwareIsp, Error) << "Camera sensor information not available";
+-		return;
+-	}
+-
+-	ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
++	int ret = ipa_->init(IPASettings{ ipaTuningFile, sensor->model() },
+ 			 debayer_->getStatsFD(),
+ 			 sharedParams_.fd(),
+-			 sensorInfo,
+ 			 sensor->controls(),
+ 			 ipaControls,
+ 			 &ccmEnabled_);

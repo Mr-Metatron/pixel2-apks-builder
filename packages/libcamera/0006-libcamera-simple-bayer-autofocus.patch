@@ -1,0 +1,815 @@
+Subject: [PATCH] libcamera: simple: implement single-shot contrast autofocus on Bayer input
+
+The MSM8998 simple pipeline needs a contrast measurement before demosaicing
+and a request path to a real lens. Measure two-axis gradients on the same
+green Bayer phase in the centre of each sampled frame, and send the result
+with its frame number. A fixed-focus camera skips the measurement.
+
+Use the lens driver's calibrated control range. Follow the coarse/fine
+contrast search and final peak check used by libcamera's RPi autofocus.
+Keep lens power until stream stop after a successful focus, and close the
+device on failure. The original camera Sensor API remains usable by other
+pipeline handlers.
+
+See https://patchwork.libcamera.org/cover/28540/ for the software ISP design
+discussion and src/ipa/rpi/controller/rpi/af.cpp for the contrast search.
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f347c5e..f63bcfa 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -27,6 +27,8 @@ public:
+ 	~CameraLens();
+ 
+ 	int init();
++	int open();
++	void close();
+ 	int setFocusPosition(int32_t position);
+ 
+ 	const std::string &model() const { return model_; }
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index 585e0d6..f8569ca 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -12,6 +12,7 @@
+ #include <initializer_list>
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <stdint.h>
+ #include <string>
+ #include <tuple>
+@@ -48,7 +49,7 @@ LOG_DECLARE_CATEGORY(SoftwareIsp)
+ class SoftwareIsp : public Object
+ {
+ public:
+-	SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
++	SoftwareIsp(PipelineHandler *pipe, CameraSensor *sensor,
+ 		    ControlInfoMap *ipaControls);
+ 	~SoftwareIsp();
+ 
+@@ -84,14 +85,14 @@ public:
+ 
+ 	Signal<FrameBuffer *> inputBufferReady;
+ 	Signal<FrameBuffer *> outputBufferReady;
+-	Signal<uint32_t, uint32_t> ispStatsReady;
++	Signal<uint32_t, uint32_t, std::optional<int32_t>> ispStatsReady;
+ 	Signal<uint32_t, const ControlList &> metadataReady;
+ 	Signal<const ControlList &> setSensorControls;
+ 
+ private:
+ 	void saveIspParams();
+ 	void setSensorCtrls(const ControlList &sensorControls);
+-	void statsReady(uint32_t frame, uint32_t bufferId);
++	void statsReady(uint32_t frame, uint32_t bufferId, std::optional<int32_t> focusFoM);
+ 	void inputReady(FrameBuffer *input);
+ 	void outputReady(FrameBuffer *output);
+ 	std::unique_ptr<Debayer> debayer_;
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 802370b..86ed75b 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <stdint.h>
+ #include <vector>
+ 
+@@ -35,7 +36,7 @@ struct StreamConfiguration;
+ class SwStatsCpu
+ {
+ public:
+-	SwStatsCpu(const CameraManager &cm);
++	SwStatsCpu(const CameraManager &cm, bool measureFocus);
+ 	~SwStatsCpu() = default;
+ 
+ 	/*
+@@ -68,6 +69,7 @@ public:
+ 			return;
+ 
+ 		(this->*stats0_)(src, stats_[statsBufferIndex]);
++		collectFocus(y, src, stats_[statsBufferIndex]);
+ 	}
+ 
+ 	void processLine2(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+@@ -82,10 +84,17 @@ public:
+ 		(this->*stats2_)(src, stats_[statsBufferIndex]);
+ 	}
+ 
+-	Signal<uint32_t, uint32_t> statsReady;
++	Signal<uint32_t, uint32_t, std::optional<int32_t>> statsReady;
+ 
+ private:
++	struct WorkerStats : SwIspStats {
++		uint64_t focusGradient;
++		uint64_t focusIntensity;
++		unsigned int focusSamples;
++	};
++
+ 	using statsProcessFn = void (SwStatsCpu::*)(const uint8_t *src[], SwIspStats &stats);
++	using focusProcessFn = void (SwStatsCpu::*)(const uint8_t *src[], WorkerStats &stats);
+ 	using processFrameFn = void (SwStatsCpu::*)(MappedFrameBuffer &in);
+ 
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+@@ -100,6 +109,9 @@ private:
+ 	void statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats);
+ 
+ 	void processBayerFrame2(MappedFrameBuffer &in);
++	void collectFocus(unsigned int y, const uint8_t *src[], WorkerStats &stats);
++	template<typename Pixel, unsigned int groupSize, unsigned int shift>
++	void greenGradients(const uint8_t *src[], WorkerStats &stats);
+ 
+ 	processFrameFn processFrame_;
+ 
+@@ -107,6 +119,10 @@ private:
+ 	statsProcessFn stats0_;
+ 	statsProcessFn stats2_;
+ 	bool swapLines_;
++	bool measureFocus_;
++	focusProcessFn focusLine_ = nullptr;
++	Rectangle focusWindow_;
++	unsigned int greenColumn_;
+ 
+ 	unsigned int ySkipMask_;
+ 
+@@ -117,7 +133,7 @@ private:
+ 	unsigned int xShift_;
+ 	unsigned int stride_;
+ 
+-	std::vector<SwIspStats> stats_;
++	std::vector<WorkerStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+ 	Benchmark bench_;
+ };
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index ccc2a6a..96221e2 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -63,8 +63,7 @@ int CameraLens::init()
+ 	}
+ 
+ 	/* Create and open the subdev. */
+-	subdev_ = std::make_unique<V4L2Subdevice>(entity_);
+-	int ret = subdev_->open();
++	int ret = open();
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -76,6 +75,32 @@ int CameraLens::init()
+ 	return 0;
+ }
+ 
++/**
++ * \brief Open the actuator for focus control
++ * \return 0 on success or a negative error code otherwise
++ */
++int CameraLens::open()
++{
++	if (subdev_ && subdev_->isOpen())
++		return 0;
++
++	auto subdev = std::make_unique<V4L2Subdevice>(entity_);
++	int ret = subdev->open();
++	if (ret)
++		return ret;
++
++	subdev_ = std::move(subdev);
++	return 0;
++}
++
++/**
++ * \brief Release the actuator's file descriptor and its runtime power reference
++ */
++void CameraLens::close()
++{
++	subdev_->close();
++}
++
+ /**
+  * \brief This function sets the focal point of the lens to a specific position.
+  * \param[in] position The focal point of the lens
+diff --git a/src/libcamera/pipeline/simple/autofocus.cpp b/src/libcamera/pipeline/simple/autofocus.cpp
+new file mode 100644
+index 0000000..21a874a
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/autofocus.cpp
+@@ -0,0 +1,179 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Single-shot contrast autofocus for the simple pipeline
++ */
++
++#include "autofocus.h"
++
++#include <algorithm>
++#include <chrono>
++#include <limits>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
++
++#include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/software_isp/swstats_cpu.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(SimpleAf)
++
++SimpleAutofocus::SimpleAutofocus(CameraLens *lens, const ControlInfo &range)
++	: lens_(lens), minimum_(range.min().get<int32_t>()),
++	  maximum_(range.max().get<int32_t>()),
++	  coarseStep_(std::max<int64_t>(1, (int64_t(maximum_) - minimum_ + 7) / 8))
++{
++}
++
++bool SimpleAutofocus::validControls(const ControlList &ctrls, bool processed)
++{
++	auto mode = ctrls.get(controls::AfMode);
++	if (mode && *mode != controls::AfModeAuto)
++		return false;
++
++	auto trigger = ctrls.get(controls::AfTrigger);
++	return !trigger || (processed && (*trigger == controls::AfTriggerStart ||
++					  *trigger == controls::AfTriggerCancel));
++}
++
++void SimpleAutofocus::request(const ControlList &ctrls)
++{
++	auto trigger = ctrls.get(controls::AfTrigger);
++	if (!trigger)
++		return;
++
++	if (*trigger == controls::AfTriggerCancel) {
++		if (state_ == controls::AfStateScanning)
++			state_ = controls::AfStateIdle;
++		return;
++	}
++
++	if (state_ == controls::AfStateScanning)
++		return;
++
++	if (lens_->open() < 0) {
++		fail();
++		return;
++	}
++
++	state_ = controls::AfStateScanning;
++	scan_ = Scan::Coarse;
++	bestScore_ = -1;
++	lowestScore_ = std::numeric_limits<int32_t>::max();
++	step_ = coarseStep_;
++	limit_ = maximum_;
++	move(minimum_);
++}
++
++void SimpleAutofocus::move(int32_t position)
++{
++	if (lens_->setFocusPosition(position) < 0) {
++		LOG(SimpleAf, Error) << "Failed to set focus position " << position;
++		fail();
++		return;
++	}
++
++	position_ = position;
++	ignoreThrough_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
++		utils::clock::now().time_since_epoch()).count();
++	settlingFrames_ = 2;
++	missingScores_ = 0;
++}
++
++void SimpleAutofocus::capture(uint64_t timestamp, ControlList &metadata)
++{
++	metadata.set(controls::AfMode, controls::AfModeAuto);
++	metadata.set(controls::AfState, state_);
++
++	/*
++	 * CAMSS timestamps the end of DMA, not the start of exposure. Discard
++	 * the frame being read and the following rolling-shutter exposure
++	 * after the command. Late IPA results carry their original timestamp.
++	 */
++	if (state_ == controls::AfStateScanning && settlingFrames_ &&
++	    timestamp > ignoreThrough_) {
++		--settlingFrames_;
++		ignoreThrough_ = timestamp;
++	}
++}
++
++void SimpleAutofocus::process(const ControlList &metadata)
++{
++	if (state_ != controls::AfStateScanning || settlingFrames_)
++		return;
++
++	auto timestamp = metadata.get(controls::SensorTimestamp);
++	if (!timestamp || *timestamp <= 0 || uint64_t(*timestamp) <= ignoreThrough_)
++		return;
++
++	auto score = metadata.get(controls::FocusFoM);
++	if (!score) {
++		if (++missingScores_ == 2 * SwStatsCpu::kStatPerNumFrames) {
++			LOG(SimpleAf, Error) << "No sharpness measurements during focus scan";
++			fail();
++		}
++		return;
++	}
++
++	sample(*score);
++}
++
++void SimpleAutofocus::sample(int32_t score)
++{
++	/*
++	 * As in libcamera's RPi contrast scan, require a 25% drop and
++	 * verify the peak again after moving back to the chosen position.
++	 */
++	if (scan_ == Scan::Verify) {
++		const bool repeatable = score > lowestScore_ &&
++					int64_t(score) * 4 >= int64_t(bestScore_) * 3 &&
++					int64_t(bestScore_) * 4 >= int64_t(score) * 3;
++		if (repeatable)
++			state_ = controls::AfStateFocused;
++		else
++			fail();
++		return;
++	}
++
++	lowestScore_ = std::min(lowestScore_, score);
++	if (score > bestScore_) {
++		bestScore_ = score;
++		bestPosition_ = position_;
++	}
++
++	if (position_ < limit_) {
++		move(std::min<int64_t>(int64_t(position_) + step_, limit_));
++		return;
++	}
++
++	if (bestScore_ - lowestScore_ < 2 || int64_t(lowestScore_) * 4 >= int64_t(bestScore_) * 3) {
++		fail();
++		return;
++	}
++
++	if (scan_ == Scan::Coarse && coarseStep_ > 1) {
++		scan_ = Scan::Fine;
++		step_ = std::max(1, coarseStep_ / 4);
++		limit_ = std::min<int64_t>(maximum_, int64_t(bestPosition_) + coarseStep_ / 2);
++		move(std::max<int64_t>(minimum_, int64_t(bestPosition_) - coarseStep_ / 2));
++		return;
++	}
++
++	scan_ = Scan::Verify;
++	move(bestPosition_);
++}
++
++void SimpleAutofocus::fail()
++{
++	state_ = controls::AfStateFailed;
++	lens_->close();
++}
++
++void SimpleAutofocus::stop()
++{
++	state_ = controls::AfStateIdle;
++	lens_->close();
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/simple/autofocus.h b/src/libcamera/pipeline/simple/autofocus.h
+new file mode 100644
+index 0000000..da3c49f
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/autofocus.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Single-shot contrast autofocus for the simple pipeline
++ */
++
++#pragma once
++
++#include <stdint.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++
++namespace libcamera {
++
++class CameraLens;
++
++class SimpleAutofocus
++{
++public:
++	SimpleAutofocus(CameraLens *lens, const ControlInfo &range);
++
++	static bool validControls(const ControlList &controls, bool processed);
++	void request(const ControlList &controls);
++	void capture(uint64_t timestamp, ControlList &metadata);
++	void process(const ControlList &metadata);
++	void stop();
++
++private:
++	enum class Scan { Coarse, Fine, Verify };
++
++	void move(int32_t position);
++	void sample(int32_t score);
++	void fail();
++
++	CameraLens *lens_;
++	const int32_t minimum_;
++	const int32_t maximum_;
++	const int32_t coarseStep_;
++	int32_t state_ = controls::AfStateIdle;
++	Scan scan_ = Scan::Coarse;
++	int32_t position_ = 0;
++	int32_t bestPosition_ = 0;
++	int32_t bestScore_ = 0;
++	int32_t lowestScore_ = 0;
++	int32_t step_ = 0;
++	int32_t limit_ = 0;
++	uint64_t ignoreThrough_ = 0;
++	unsigned int settlingFrames_ = 0;
++	unsigned int missingScores_ = 0;
++};
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/simple/meson.build b/src/libcamera/pipeline/simple/meson.build
+index dda3de9..1150cf3 100644
+--- a/src/libcamera/pipeline/simple/meson.build
++++ b/src/libcamera/pipeline/simple/meson.build
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ libcamera_internal_sources += files([
++    'autofocus.cpp',
+     'simple.cpp',
+ ])
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 1daee38..41b5f54 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
+ #include <iterator>
+ #include <list>
+ #include <map>
+@@ -33,6 +34,7 @@
+ #include <libcamera/stream.h>
+ 
+ #include "libcamera/internal/camera.h"
++#include "libcamera/internal/camera_lens.h"
+ #include "libcamera/internal/camera_manager.h"
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/camera_sensor_properties.h"
+@@ -48,6 +50,8 @@
+ #include "libcamera/internal/v4l2_subdevice.h"
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
++#include "autofocus.h"
++
+ namespace libcamera {
+ 
+ LOG_DEFINE_CATEGORY(SimplePipeline)
+@@ -359,6 +363,7 @@ public:
+ 
+ 	std::unique_ptr<Converter> converter_;
+ 	std::unique_ptr<SoftwareIsp> swIsp_;
++	std::optional<SimpleAutofocus> autofocus_;
+ 	SimpleFrames frameInfo_;
+ 
+ private:
+@@ -369,7 +374,7 @@ private:
+ 	void conversionInputDone(FrameBuffer *buffer);
+ 	void conversionOutputDone(FrameBuffer *buffer);
+ 
+-	void ispStatsReady(uint32_t frame, uint32_t bufferId);
++	void ispStatsReady(uint32_t frame, uint32_t bufferId, std::optional<int32_t> focusFoM);
+ 	void metadataReady(uint32_t frame, const ControlList &metadata);
+ 	void setSensorControls(const ControlList &sensorControls);
+ };
+@@ -629,6 +634,23 @@ int SimpleCameraData::init()
+ 		}
+ 	}
+ 
++	if (CameraLens *lens = sensor_->focusLens()) {
++		auto range = lens->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
++		if (swIsp_ && range != lens->controls().end() && range->first->isInput() &&
++		    range->second.min().get<int32_t>() < range->second.max().get<int32_t>()) {
++			autofocus_.emplace(lens, range->second);
++			ControlInfoMap::Map ctrls(controlInfo_.begin(), controlInfo_.end());
++			const std::array<ControlValue, 1> modes{ controls::AfModeAuto };
++			ctrls.emplace(&controls::AfMode, ControlInfo(modes));
++			ctrls.emplace(&controls::AfTrigger, ControlInfo(controls::AfTriggerValues));
++			ctrls.emplace(&controls::AfState, ControlInfo(controls::AfStateValues));
++			ctrls.emplace(&controls::FocusFoM, ControlInfo(0, 131072));
++			controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
++		}
++		/* Enumeration opens the lens subdevice and powers the actuator. */
++		lens->close();
++	}
++
+ 	video_ = pipe->video(entities_.back().entity);
+ 	ASSERT(video_);
+ 
+@@ -937,9 +959,15 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 		}
+ 	}
+ 
+-	if (request)
+-		request->_d()->metadata().set(controls::SensorTimestamp,
+-					      buffer->metadata().timestamp);
++	if (request) {
++		auto &metadata = request->_d()->metadata();
++		const uint64_t timestamp = buffer->metadata().timestamp;
++		metadata.set(controls::SensorTimestamp, timestamp);
++		if (useConversion_ && autofocus_) {
++			autofocus_->request(request->controls());
++			autofocus_->capture(timestamp, metadata);
++		}
++	}
+ 
+ 	/*
+ 	 * Queue the captured and the request buffer to the converter or Software
+@@ -1022,8 +1050,19 @@ void SimpleCameraData::conversionOutputDone(FrameBuffer *buffer)
+ 		tryCompleteRequest(request);
+ }
+ 
+-void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId)
++void SimpleCameraData::ispStatsReady(uint32_t frame, uint32_t bufferId,
++				     std::optional<int32_t> focusFoM)
+ {
++	SimpleFrameInfo *info = frameInfo_.find(frame);
++	if (!info)
++		return;
++
++	auto &metadata = info->request->_d()->metadata();
++	if (focusFoM && autofocus_)
++		metadata.set(controls::FocusFoM, *focusFoM);
++	if (autofocus_)
++		autofocus_->process(metadata);
++
+ 	swIsp_->processStats(frame, bufferId,
+ 			     delayedCtrls_->get(frame));
+ }
+@@ -1613,13 +1652,17 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 		return data->video_->exportBuffers(count, buffers);
+ }
+ 
+-int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ {
+ 	SimpleCameraData *data = cameraData(camera);
+ 	V4L2VideoDevice *video = data->video_;
+ 	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
+ 	int ret;
+ 
++	if (data->autofocus_ && controls &&
++	    !SimpleAutofocus::validControls(*controls, data->useConversion_))
++		return -EINVAL;
++
+ 	const MediaPad *pad = acquirePipeline(data);
+ 	if (pad) {
+ 		LOG(SimplePipeline, Info)
+@@ -1686,6 +1729,9 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 				video->queueBuffer(buffer.get());
+ 	}
+ 
++	if (data->autofocus_ && controls)
++		data->autofocus_->request(*controls);
++
+ 	return 0;
+ }
+ 
+@@ -1695,6 +1741,9 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	V4L2VideoDevice *video = data->video_;
+ 	V4L2Subdevice *frameStartEmitter = data->frameStartEmitter_;
+ 
++	if (data->autofocus_)
++		data->autofocus_->stop();
++
+ 	if (frameStartEmitter) {
+ 		frameStartEmitter->setFrameStartEnabled(false);
+ 		frameStartEmitter->frameStart.disconnect(data->delayedCtrls_.get(),
+@@ -1728,6 +1777,16 @@ int SimplePipelineHandler::queueRequestDevice(Camera *camera, Request *request)
+ 	std::map<const Stream *, FrameBuffer *> buffers;
+ 	bool metadataRequired = false;
+ 
++	if (data->autofocus_) {
++		const auto &streams = request->buffers();
++		bool processed = data->useConversion_ &&
++				 std::any_of(streams.begin(), streams.end(), [data](const auto &entry) {
++					 return entry.first != data->rawStream_;
++				 });
++		if (!SimpleAutofocus::validControls(request->controls(), processed))
++			return -EINVAL;
++	}
++
+ 	for (auto &[stream, buffer] : request->buffers()) {
+ 		/*
+ 		 * If conversion is needed, push the buffer to the converter
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index d227bd8..0d20428 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -77,7 +77,7 @@ LOG_DEFINE_CATEGORY(SoftwareIsp)
+  * \param[out] ipaControls The IPA controls to update
+  * handler
+  */
+-SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
++SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, CameraSensor *sensor,
+ 			 ControlInfoMap *ipaControls)
+ 	: ispWorkerThread_("SWIspWorker"),
+ 	  dmaHeap_(DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
+@@ -97,7 +97,7 @@ SoftwareIsp::SoftwareIsp(PipelineHandler *pipe, const CameraSensor *sensor,
+ 
+ 	const CameraManager &cm = *pipe->cameraManager();
+ 
+-	auto stats = std::make_unique<SwStatsCpu>(cm);
++	auto stats = std::make_unique<SwStatsCpu>(cm, sensor->focusLens() != nullptr);
+ 	if (!stats->isValid()) {
+ 		LOG(SoftwareIsp, Error) << "Failed to create SwStatsCpu object";
+ 		return;
+@@ -422,9 +422,9 @@ void SoftwareIsp::setSensorCtrls(const ControlList &sensorControls)
+ 	setSensorControls.emit(sensorControls);
+ }
+ 
+-void SoftwareIsp::statsReady(uint32_t frame, uint32_t bufferId)
++void SoftwareIsp::statsReady(uint32_t frame, uint32_t bufferId, std::optional<int32_t> focusFoM)
+ {
+-	ispStatsReady.emit(frame, bufferId);
++	ispStatsReady.emit(frame, bufferId, focusFoM);
+ }
+ 
+ void SoftwareIsp::inputReady(FrameBuffer *input)
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 5366e01..be696a6 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -36,9 +36,10 @@ namespace libcamera {
+  */
+ 
+ /**
+- * \fn SwStatsCpu::SwStatsCpu(const CameraManager &cm)
++ * \fn SwStatsCpu::SwStatsCpu(const CameraManager &cm, bool measureFocus)
+  * \brief Construct a SwStatsCpu object
+  * \param[in] cm The camera manager
++ * \param[in] measureFocus Gather a focus figure of merit for a controllable lens
+  *
+  * Creates a SwStatsCpu object and initialises shared memory for statistics
+  * exchange.
+@@ -159,8 +160,8 @@ namespace libcamera {
+ 
+ LOG_DEFINE_CATEGORY(SwStatsCpu)
+ 
+-SwStatsCpu::SwStatsCpu(const CameraManager &cm)
+-	: sharedStats_("softIsp_stats"), bench_(cm, "CPU stats")
++SwStatsCpu::SwStatsCpu(const CameraManager &cm, bool measureFocus)
++	: measureFocus_(measureFocus), sharedStats_("softIsp_stats"), bench_(cm, "CPU stats")
+ {
+ 	if (!sharedStats_)
+ 		LOG(SwStatsCpu, Error)
+@@ -323,6 +324,40 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
++/*
++ * Measure squared spatial gradients on one green Bayer plane, before colour
++ * interpolation. The neighbours are two pixels apart in each direction so
++ * differences in colour response between photosites do not contribute. All
++ * formats use their top eight bits, as in the existing packed RAW10 histogram.
++ */
++template<typename Pixel, unsigned int groupSize, unsigned int shift>
++void SwStatsCpu::greenGradients(const uint8_t *src[], WorkerStats &stats)
++{
++	const Pixel *above = reinterpret_cast<const Pixel *>(src[0]) + greenColumn_;
++	const Pixel *below = reinterpret_cast<const Pixel *>(src[2]) + greenColumn_;
++	unsigned int firstGroup = (focusWindow_.x + 3) / 4;
++	unsigned int endGroup = (focusWindow_.x + focusWindow_.width) / 4;
++
++	for (unsigned int group = firstGroup; group < endGroup; group += 2) {
++		unsigned int index = group * groupSize;
++		int centre = below[index] >> shift;
++		int right = below[index + 2] >> shift;
++		int upper = above[index] >> shift;
++		int dx = right - centre;
++		int dy = upper - centre;
++		stats.focusGradient += dx * dx + dy * dy;
++		stats.focusIntensity += centre * centre + right * right + upper * upper;
++		++stats.focusSamples;
++	}
++}
++
++void SwStatsCpu::collectFocus(unsigned int y, const uint8_t *src[], WorkerStats &stats)
++{
++	if (focusLine_ && !(y % 8) && y > static_cast<unsigned int>(focusWindow_.y) &&
++	    y + 1 < focusWindow_.y + focusWindow_.height)
++		(this->*focusLine_)(src, stats);
++}
++
+ /**
+  * \brief Reset state to start statistics gathering for a new frame
+  * \param[in] frame The frame number
+@@ -340,6 +375,9 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.yHistogram.fill(0);
++		s.focusGradient = 0;
++		s.focusIntensity = 0;
++		s.focusSamples = 0;
+ 	}
+ }
+ 
+@@ -353,19 +391,28 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ {
+ 	bool valid = frame % kStatPerNumFrames == 0;
++	std::optional<int32_t> focusFoM;
+ 
+ 	if (valid) {
++		uint64_t gradient = 0;
++		uint64_t intensity = 0;
++		unsigned int samples = 0;
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
++			gradient += s.focusGradient;
++			intensity += s.focusIntensity;
++			samples += s.focusSamples;
+ 			sharedStats_->sum_ += s.sum_;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}
++		if (samples)
++			focusFoM = intensity ? static_cast<int32_t>(65536.0 * gradient / intensity) : 0;
+ 	}
+ 
+ 	sharedStats_->valid = valid;
+-	statsReady.emit(frame, bufferId);
++	statsReady.emit(frame, bufferId, focusFoM);
+ }
+ 
+ /**
+@@ -418,6 +465,10 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 
+ 	BayerFormat bayerFormat =
+ 		BayerFormat::fromPixelFormat(inputCfg.pixelFormat);
++	/* Green column on either of the odd-numbered rows around line 0. */
++	greenColumn_ = bayerFormat.order == BayerFormat::BGGR ||
++		       bayerFormat.order == BayerFormat::RGGB ? 0 : 1;
++	focusLine_ = nullptr;
+ 
+ 	if (bayerFormat.packing == BayerFormat::Packing::None &&
+ 	    setupStandardBayerOrder(bayerFormat.order) == 0) {
+@@ -425,12 +476,18 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 		switch (bayerFormat.bitDepth) {
+ 		case 8:
+ 			stats0_ = &SwStatsCpu::statsBGGR8Line0;
++			if (measureFocus_)
++				focusLine_ = &SwStatsCpu::greenGradients<uint8_t, 4, 0>;
+ 			return 0;
+ 		case 10:
+ 			stats0_ = &SwStatsCpu::statsBGGR10Line0;
++			if (measureFocus_)
++				focusLine_ = &SwStatsCpu::greenGradients<uint16_t, 4, 2>;
+ 			return 0;
+ 		case 12:
+ 			stats0_ = &SwStatsCpu::statsBGGR12Line0;
++			if (measureFocus_)
++				focusLine_ = &SwStatsCpu::greenGradients<uint16_t, 4, 4>;
+ 			return 0;
+ 		}
+ 	}
+@@ -443,6 +500,8 @@ int SwStatsCpu::configure(const StreamConfiguration &inputCfg, unsigned int stat
+ 		ySkipMask_ = 0x02;
+ 		xShift_ = 0;
+ 		processFrame_ = &SwStatsCpu::processBayerFrame2;
++		if (measureFocus_)
++			focusLine_ = &SwStatsCpu::greenGradients<uint8_t, 5, 0>;
+ 
+ 		switch (bayerFormat.order) {
+ 		case BayerFormat::BGGR:
+@@ -505,6 +564,8 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	window_.width = (window_.width > xShift_ ? window_.width - xShift_ : 0);
+ 	window_.width &= ~(patternSize_.width - 1);
+ 	window_.height &= ~(patternSize_.height - 1);
++	focusWindow_ = Rectangle(window_.x + window_.width / 4, window_.y + window_.height / 4,
++				 window_.width / 2, window_.height / 2);
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -521,10 +582,11 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 			continue;
+ 		}
+ 
+-		/* linePointers[0] is not used by any stats0_ functions */
++		linePointers[0] = y ? src - stride_ : src;
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
+ 		(this->*stats0_)(linePointers, stats_[0]);
++		collectFocus(window_.y + y, linePointers, stats_[0]);
+ 		src += stride_ * 2;
+ 	}
+ }

@@ -1,0 +1,142 @@
+Subject: [PATCH] ipa: simple: opt in to highlight-aware metering with EV compensation
+
+Enable through Agc.protectHighlights in the sensor tuning. Use linear
+pre-gamma luminance and apply compensation after calculating the
+highlight limit. Report the EV selected for that request.
+
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index 2f7e040..e636e2c 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -7,11 +7,13 @@
+ 
+ #include "agc.h"
+ 
++#include <cmath>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+ 
+ #include "control_ids.h"
++#include "libipa/histogram.h"
+ 
+ namespace libcamera {
+ 
+@@ -37,8 +39,48 @@ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
+  */
+ static constexpr float kExposureSatisfactory = 0.2;
+ 
+-Agc::Agc()
++int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	protectHighlights_ = tuningData["protectHighlights"].get<bool>(false);
++	if (protectHighlights_)
++		context.ctrlMap[&controls::ExposureValue] = ControlInfo(-2.0f, 2.0f, 0.0f);
++	return 0;
++}
++
++void Agc::queueRequest(IPAContext &context, [[maybe_unused]] uint32_t frame,
++		       IPAFrameContext &frameContext, const ControlList &controls)
++{
++	auto &ev = context.activeState.agc.ev;
++	ev = controls.get(controls::ExposureValue).value_or(ev);
++	frameContext.ev = ev;
++}
++
++void Agc::meterHighlights(IPAContext &context, IPAFrameContext &frameContext, const SwIspStats &stats)
++{
++	const Histogram hist(stats.yHistogram);
++	if (!hist.total())
++		return;
++
++	const double black = context.activeState.blc.level * hist.bins() / 256.0;
++	const double range = hist.bins() - black;
++	/* Meter the central 90% to linear middle grey. Leave 10% headroom
++	 * for the 99th percentile, so a single glint does not dim the scene.
++	 */
++	const double middle = std::max(hist.interQuantileMean(0.05, 0.95) - black, 0.5);
++	const double highlights = std::max(hist.quantile(0.99) - black, 0.5);
++	const double ratio = std::min(0.18 * range / middle, 0.90 * range / highlights) *
++			     std::exp2(frameContext.ev);
++	if (std::abs(ratio - 1.0) < 0.05)
++		return;
++
++	/* Limit each correction to one stop and damp small errors. */
++	const double step = std::clamp(std::sqrt(ratio), 0.5, 2.0);
++	const auto &limits = context.configuration.agc;
++	auto &sensor = frameContext.sensor;
++	const double total = sensor.exposure * sensor.gain * step;
++	sensor.exposure = std::clamp<int32_t>(std::lround(total / limits.againMin),
++					      limits.exposureMin, limits.exposureMax);
++	sensor.gain = std::clamp(total / sensor.exposure, limits.againMin, limits.againMax);
+ }
+ 
+ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
+@@ -110,6 +152,9 @@ void Agc::process(IPAContext &context,
+ 	metadata.set(controls::ExposureTime, exposureTime.get<std::micro>());
+ 	metadata.set(controls::AnalogueGain, frameContext.sensor.gain);
+ 
++	if (protectHighlights_)
++		metadata.set(controls::ExposureValue, frameContext.ev);
++
+ 	if (!context.activeState.agc.valid) {
+ 		/*
+ 		 * Init active-state from sensor values in case updateExposure()
+@@ -130,6 +175,13 @@ void Agc::process(IPAContext &context,
+ 		return;
+ 	}
+ 
++	if (protectHighlights_) {
++		meterHighlights(context, frameContext, *stats);
++		context.activeState.agc.exposure = frameContext.sensor.exposure;
++		context.activeState.agc.again = frameContext.sensor.gain;
++		return;
++	}
++
+ 	/*
+ 	 * Calculate Mean Sample Value (MSV) according to formula from:
+ 	 * https://www.araa.asn.au/acra/acra2007/papers/paper84final.pdf
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index 112d9f5..a0fdd85 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -16,7 +16,9 @@ namespace ipa::soft::algorithms {
+ class Agc : public Algorithm
+ {
+ public:
+-	Agc();
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void queueRequest(IPAContext &context, uint32_t frame, IPAFrameContext &frameContext,
++			  const ControlList &controls) override;
+ 	~Agc() = default;
+ 
+ 	void process(IPAContext &context, const uint32_t frame,
+@@ -25,6 +27,8 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
++	void meterHighlights(IPAContext &context, IPAFrameContext &frameContext, const SwIspStats &stats);
++	bool protectHighlights_ = false;
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
+ };
+ 
+diff --git a/src/ipa/simple/ipa_context.h b/src/ipa/simple/ipa_context.h
+index 8487330..e18ec66 100644
+--- a/src/ipa/simple/ipa_context.h
++++ b/src/ipa/simple/ipa_context.h
+@@ -39,6 +39,7 @@ struct IPAActiveState {
+ 	struct {
+ 		int32_t exposure;
+ 		double again;
++		float ev;
+ 		bool valid;
+ 	} agc;
+ 
+@@ -76,6 +77,7 @@ struct IPAFrameContext : public FrameContext {
+ 		double blue;
+ 	} gains;
+ 
++	float ev;
+ 	float gamma;
+ 	std::optional<float> contrast;
+ 	std::optional<float> saturation;

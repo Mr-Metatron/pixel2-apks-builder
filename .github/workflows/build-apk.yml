@@ -1,0 +1,105 @@
+name: Build ARM64 APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Comma-separated packages in build order (for example libcamera,plasma-camera)
+        required: true
+        type: string
+        default: plasma-camera
+      alpine_image:
+        description: Starting image (alpine:3.24 or alpine:edge)
+        type: string
+        default: alpine:3.24
+      source_date_epoch:
+        description: Unix timestamp (defaults to the checkout commit time)
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      BUILD_PACKAGES: ${{ inputs.packages }}
+      REQUESTED_IMAGE: ${{ inputs.alpine_image }}
+      REQUESTED_EPOCH: ${{ inputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          [[ "$(uname -m)" == aarch64 ]]
+          [[ "$BUILD_PACKAGES" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]]
+          IFS=, read -ra packages <<< "$BUILD_PACKAGES"
+          for package in "${packages[@]}"; do
+            test -f "packages/$package/APKBUILD"
+          done
+          case "$REQUESTED_IMAGE" in
+            alpine:3.24|alpine:edge) ;;
+            *) echo "Select alpine:3.24 or alpine:edge." >&2; exit 1 ;;
+          esac
+          epoch="${REQUESTED_EPOCH:-$(git show -s --format=%ct HEAD)}"
+          [[ "$epoch" =~ ^(0|[1-9][0-9]*)$ ]]
+          printf 'SOURCE_DATE_EPOCH=%s\n' "$epoch" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.arch }}-${{ inputs.packages }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.arch }}-${{ inputs.packages }}-
+
+      - name: Build on native ARM64
+        id: build
+        run: |
+          start=$(date +%s)
+          mkdir -p out .ccache
+          image="$REQUESTED_IMAGE"
+          if [[ "$image" == alpine:3.24 ]] &&
+             ! docker buildx imagetools inspect "$image" --raw |
+               jq -e 'any(.manifests[]; .platform.os == "linux" and .platform.architecture == "arm64")' >/dev/null; then
+            image=alpine:edge
+            echo "::notice::The Alpine 3.24 ARM64 manifest was unavailable. Starting from Alpine edge and resolving against the pinned 3.24 repositories."
+          fi
+          docker pull --platform linux/arm64 "$image"
+          image_digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
+          docker run --rm --platform linux/arm64 \
+            -e BUILD_PACKAGES -e SOURCE_DATE_EPOCH -e BUILD_COMMIT="$GITHUB_SHA" \
+            -e BUILD_IMAGE="$image_digest" -e BUILD_UID="$(id -u)" \
+            -v "$PWD:/src:ro" -v "$PWD/out:/out" -v "$PWD/.ccache:/ccache" \
+            "$image_digest" /bin/sh /src/scripts/build-in-container.sh 2>&1 | tee out/build.log
+          printf 'duration=%s\n' "$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-apks
+          path: |
+            out/*.apk
+            out/SHA256SUMS.txt
+            out/build-manifest.json
+            out/build.log
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Write build summary
+        env:
+          BUILD_DURATION: ${{ steps.build.outputs.duration }}
+        run: |
+          {
+            printf '## Native ARM64 APK build\n\n'
+            printf 'Packages `%s` · %s seconds\n\n' "$BUILD_PACKAGES" "$BUILD_DURATION"
+            printf '| APK | SHA-256 |\n| --- | --- |\n'
+            while read -r digest file; do
+              printf '| `%s` | `%s` |\n' "$file" "$digest"
+            done < out/SHA256SUMS.txt
+          } >> "$GITHUB_STEP_SUMMARY"

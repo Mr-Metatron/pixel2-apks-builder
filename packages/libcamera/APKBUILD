@@ -1,0 +1,217 @@
+# Forked from Alpine for temporary downstream patches
+maintainer="Robert Mader <robert.mader@collabora.com>"
+pkgname=libcamera
+_pkgver=0.7.1
+pkgver=9999$_pkgver
+pkgrel=12
+pkgdesc="Linux camera framework"
+url="https://libcamera.org/"
+arch="all"
+license="LGPL-2.1-or-later AND GPL-2.0-or-later"
+# upstream calls 'date' with a non-POSIX option so we pull in coreutils
+makedepends="
+	coreutils
+	doxygen
+	eudev-dev
+	glib-dev
+	gnutls-dev
+	graphviz
+	gst-plugins-base-dev
+	gtest-dev
+	libevent-dev
+	libpisp-dev
+	libunwind-dev
+	libyuv-dev
+	linux-headers
+	meson
+	py3-jinja2
+	py3-ply
+	py3-pybind11-dev
+	py3-sphinx
+	py3-sphinxcontrib-doxylink
+	py3-yaml
+	python3-dev
+	qt6-qtbase-dev
+	qt6-qttools-dev
+	yaml-dev
+	"
+subpackages="
+	$pkgname-dbg
+	$pkgname-dev
+	qcam
+	$pkgname-gstreamer
+	$pkgname-v4l2
+	$pkgname-tools
+	py3-$pkgname:py3
+	"
+_tuning_files="
+	hi846.yaml
+	imx355.yaml
+	imx363.yaml
+	imx371.yaml
+	imx376.yaml
+	imx858.yaml
+	s5k3l6xx.yaml
+	s5kjn1.yaml
+	"
+source="https://gitlab.freedesktop.org/camera/libcamera/-/archive/v$_pkgver/libcamera-v$_pkgver.tar.gz
+	0001-libcamera-simple-Enable-softISP-for-the-Pinephone.patch
+	0002-libcamera-simple-Skip-hwISP-formats-if-swISP-is-acti.patch
+	0003-RFC-egl-Implement-DMABuf-import-for-input-buffers.patch
+	0004-libipa-register-imx179-imx362-gain.patch
+	0005-libcamera-add-imx179-unit-cell-size.patch
+	0006-libcamera-simple-bayer-autofocus.patch
+	0007-simple-use-binned-imx362-preview-and-refine-focus-early.patch
+	0008-simple-walleye-preview-and-sensor-timing.patch
+	0009-softipa-highlight-metering-and-exposure-value.patch
+	0010-softipa-select-ccm-by-sensor-mode.patch
+	0011-simple-track-controls-on-capture-frames.patch
+	0012-debayer-egl-pad-linear-output-buffers.patch
+	0013-imx362-pdaf-capture-and-focus.patch
+	0014-simple-walleye-native-pdaf.patch
+	0015-debayer-egl-zero-copy-packed-input-remap.patch
+	0016-debayer-egl-optimize-packed-input-remap.patch
+	0017-dma-buf-prefer-system-heap.patch
+	0018-simple-weight-bright-awb-and-bound-highlight-loss.patch
+	qcam.desktop
+	$_tuning_files
+	"
+builddir="$srcdir/$pkgname-v$_pkgver"
+# gstreamer tests fail
+# manual strip because ipa .sign files depend on the file contents- have to re-sign after strip
+options="!strip !check"
+
+case "$CARCH" in
+arm*|aarch64)
+	subpackages="$subpackages $pkgname-raspberrypi"
+	;;
+esac
+
+case "$CARCH" in
+ppc64le|s390x|riscv64|loongarch64)
+	# doesn't install any ipa
+	;;
+*)
+	depends="$pkgname-ipa=$pkgver-r$pkgrel"
+	subpackages="$subpackages $pkgname-ipa"
+	;;
+esac
+
+build() {
+	abuild-meson \
+		-Dpipelines=auto,virtual \
+		-Dv4l2=true \
+		-Dwerror=false \
+		-Ddocumentation=disabled \
+		. output
+	meson compile -j "$JOBS" -C output
+}
+
+check() {
+	meson test -C output --print-errorlogs
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild -C output
+	install -Dm644 -t "$pkgdir"/usr/share/applications "$srcdir"/qcam.desktop
+
+	# manual strip first..
+	scanelf --recursive \
+		--nobanner \
+		--etype "ET_DYN,ET_EXEC" \
+		--format "%F" \
+		"$pkgdir" \
+		| while read -r file; do
+			strip "$file"
+	done
+}
+
+ipa() {
+	depends=""
+	amove usr/lib/libcamera
+	amove usr/share/libcamera/ipa
+
+	for _tuning_file in $_tuning_files; do
+		install -Dm644 -t "$subpkgdir"/usr/share/libcamera/ipa/simple \
+			"$srcdir"/"$_tuning_file"
+	done
+
+	# then sign ipa's
+	local ipa
+	for ipa in "$subpkgdir"/usr/lib/libcamera/ipa/ipa*.so; do
+		msg "signing $ipa"
+		"$builddir"/src/ipa/ipa-sign.sh \
+			"$(find "$builddir"/output -type f -iname "*ipa-priv-key.pem")" \
+			"$ipa" \
+			"$ipa".sign
+	done
+}
+
+qcam() {
+	depends=""
+	amove usr/bin/qcam
+
+	amove usr/share/applications/qcam.desktop
+}
+
+gstreamer() {
+	depends=""
+	amove usr/lib/gstreamer-1.0
+}
+
+v4l2() {
+	depends=""
+	amove usr/libexec/libcamera/v4l2-compat.so
+}
+
+raspberrypi() {
+	depends=""
+	amove usr/share/libcamera/ipa/rpi
+	amove usr/libexec/libcamera/raspberrypi_ipa_proxy
+	amove usr/share/libcamera/pipeline/rpi/vc4
+}
+
+tools() {
+	depends=""
+	amove usr/bin/cam
+	amove usr/bin/imx362-pdaf
+	amove usr/bin/lc-compliance
+}
+
+py3() {
+	pkgdesc="$pkgname (python bindings)"
+	depends="python3"
+
+	amove usr/lib/python*
+}
+
+sha512sums="
+0e886021a3bbd668184b581248b9d89a8e909360a7f138237a2c03b41b477cb255bd6daf4932fdebf86c3410b4deccc4c5db93264ed0c6c9969076cdbae8a77b  libcamera-v0.7.1.tar.gz
+aa24b1caab3d0e6bca413ff149aafa5233ba8141c2585b1b55c655759dd663612091222135ec5add402e60bf53d58c307f3f3127385efaa11b6cef866e03906e  0001-libcamera-simple-Enable-softISP-for-the-Pinephone.patch
+cd1559a70dabe8711bb2cc1a8c6dca114e9f5b83088000935845ad90e5d109e2b215f0810f709f5bf00dd76be76e937bad4db49a1c6662135ec1704809a9a62b  0002-libcamera-simple-Skip-hwISP-formats-if-swISP-is-acti.patch
+6bca235e430e7392f68c94742d1bc1cd19cffe12ac03c8890ffa27b756972df67f5a408f4c806149a6b4f52827881a73d14d7f6a00bab9d4692f5eb9b06478a5  0003-RFC-egl-Implement-DMABuf-import-for-input-buffers.patch
+56c860889eaa8d3fa8775de5b68c66b965a59b7ef2781d4928384b5045b19ee6fe6065172767a37da9e3537e07ba02e93bfc267fe7e5cda18be5da32ce619143  0004-libipa-register-imx179-imx362-gain.patch
+15f3a39373f7fbfe8df158ce1b986fabd1f4b3ec99729195b6f276bd0299a68bb13fff9a360ea2c5dbaac74ee10bef514edaed3ded23149b22bb66de6402b408  0005-libcamera-add-imx179-unit-cell-size.patch
+20528869f6363f31173f900bc17f5d8d476eb337794e867bcc27b7549fcc1352ca802a5065440386e9a545faa24b74a9521a61d31a47c550f2ea0b2f66f9dc5c  0006-libcamera-simple-bayer-autofocus.patch
+d12593b2c989d554420e16d690eabfd70b2d102118ab09b87a117f67996a220c6b1f9e53803312357b70e27534f1e5367377e872588efa6c63ccc71888e89e24  0007-simple-use-binned-imx362-preview-and-refine-focus-early.patch
+63174e44baa8f49639039a54be05facfa56e51c9d54ee0a58c9bac3f0fb5892ca00cf07c40115c11dea1f8afd0f6cf1ff46e967567651bb0ae5cca33884cca31  0008-simple-walleye-preview-and-sensor-timing.patch
+040c0eb6e7310b634ed9daf37d72a5074e1968a8c28aac9b7f12b3cee0e475cfd70bb73a008f94fa385f0483c094c9af49596c051346da3f59c3a4e3c88f1783  0009-softipa-highlight-metering-and-exposure-value.patch
+66b095c0c631925a80a413d19296d630e731ad496709a2ed4410724d786555d7b96b84f3d8f60829b6f23419385b09c5457fec220feb926fe5f98bffd439563e  0010-softipa-select-ccm-by-sensor-mode.patch
+c0fce24ca192f45efa50539cfa95e3659b04088c913ce7f12c0b667d6ebc4a5644b7c3b2b37e1310e2cbc4eba26388491f3aca7cb23f972578e2eddf12041644  0011-simple-track-controls-on-capture-frames.patch
+6de3b2702178ddd9080ac9d5e77574777bb1d3963ffcd8a90e1dbe290f81d1662e735fbb1dd41b979c3a3f91c9af9095a9c8fe635bedfc973c187aabbc4dd22b  0012-debayer-egl-pad-linear-output-buffers.patch
+9ebd095d0be37f5a8c86f2c2a7c6371d7a561e2d61f38ef1fed14ed82ac1235fab5423df60139c92208da0ccc8ffb7875a9db15d567259a7794b1f77e4d217db  0013-imx362-pdaf-capture-and-focus.patch
+9935a658d3fbc822f8c2876d30353fcb367462d60b0c1c1b76509672730d5002439272f1c5f6f2e8b257640a92f935b9569309863e651271af89c38d55394aed  0014-simple-walleye-native-pdaf.patch
+f81bba014e15ed8a5e8238ff031b753db281534118c323c593dc296a17fa0720fe3d3e9d11d79dbf49491375da9a41f7f49e60ced1e197205b4dcff1e7f66dd6  0015-debayer-egl-zero-copy-packed-input-remap.patch
+53d6f232c730712e95b9d102d578247dc26512b6d34991933d8a7fcdfef2fbb3a74eaaefb457156fc1ff04a269333bcad87177b069e62e7cc1805e838a246f09  0016-debayer-egl-optimize-packed-input-remap.patch
+187324975750b535cb6d3f62424a110e19de76decfb87960b67b039639bc103f7399d7a18c3891fa5e85ee57a9e1cbf2b4ef598f7daa431cbe26dcb3e0f00679  0017-dma-buf-prefer-system-heap.patch
+b2e90d4c2e997a4952ebd8b95241bafc069135b723bacc5231eafe208c9468041c1d7263076b865a51ea07b0f4dc6c5c4145f05385e984a4be3077b4f6440fe2  0018-simple-weight-bright-awb-and-bound-highlight-loss.patch
+22167a4eceb6d1b40b0b7c45fdf116c71684f5340de7f767535cb8e160ad9d2ae0f00cb3d461f73a344520a48a4641cf46226841d78bee06bfbfd2a91337f754  qcam.desktop
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  hi846.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  imx355.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  imx363.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  imx371.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  imx376.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  imx858.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  s5k3l6xx.yaml
+2ee566653b17d565d2c0de67cbe6ebad25df5aac6051cad78e6bae52016fa2ca0247e964d735ac776b3e0bd447ead9c4fcb26cd7629228cdba3ceb91b46f378f  s5kjn1.yaml
+"

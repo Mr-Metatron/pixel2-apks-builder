@@ -1,0 +1,150 @@
+Subject: [PATCH] plasma-camera: expose compensation on a bounded EV slider
+
+Apply to plasma-camera 2.1.1 after 0001 through 0005.
+Use the selected camera's ExposureValue capability, limits and current
+setting. Keep the existing settingsChanged -> Worker -> Request path.
+
+diff --git a/src/contents/ui/camera/CameraExtraControls.qml b/src/contents/ui/camera/CameraExtraControls.qml
+index 9f78190..08212ff 100644
+--- a/src/contents/ui/camera/CameraExtraControls.qml
++++ b/src/contents/ui/camera/CameraExtraControls.qml
+@@ -107,6 +107,7 @@ Rectangle {
+ 
+         ExposureSelectStrip {
+             id: exposureSelectStrip
++            camera: root.camera
+             visible: root.exposureValueEnabled
+             shown: false // Set by exposureControlsButton
+ 
+diff --git a/src/contents/ui/camera/ExposureSelectStrip.qml b/src/contents/ui/camera/ExposureSelectStrip.qml
+index d9b872c..87d85d0 100644
+--- a/src/contents/ui/camera/ExposureSelectStrip.qml
++++ b/src/contents/ui/camera/ExposureSelectStrip.qml
+@@ -6,11 +6,12 @@ import QtQuick.Controls as QQC2
+ import QtQuick.Layouts
+ 
+ import org.kde.kirigami as Kirigami
++import org.kde.plasmacamera
+ 
+ Item {
+     id: root
+ 
+-    // TODO: read value of exposure before opening
++    required property PlasmaCamera camera
+ 
+     // Whether the component should be shown
+     required property bool shown
+@@ -28,10 +29,6 @@ Item {
+         }
+     }
+ 
+-    FontMetrics {
+-        id: fontMetrics
+-    }
+-
+     ColumnLayout {
+         id: columnLayout
+         spacing: Kirigami.Units.smallSpacing
+@@ -42,54 +39,24 @@ Item {
+         QQC2.Label {
+             Layout.topMargin: Kirigami.Units.smallSpacing
+             Layout.fillWidth: true
+-            text: i18n("Exposure Value")
++            text: i18n("Exposure Value") + "  " + Number(slider.value).toLocaleString(Qt.locale(), 'f', 1)
+             horizontalAlignment: Text.AlignHCenter
+             font.weight: Font.Bold
+             font.pointSize: Kirigami.Theme.smallFont.pointSize
+         }
+ 
+-        Item {
++        QQC2.Slider {
++            id: slider
+             Layout.fillWidth: true
+-            implicitHeight: Kirigami.Units.gridUnit * 2
+-            clip: true
+-
+-            // The tumbler does some weird things with rotation, don't put it in layout
+-            QQC2.Tumbler {
+-                id: exposureTumbler
+-                anchors.centerIn: parent
+-
+-                wrap: false
+-                implicitHeight: Kirigami.Units.gridUnit * 25
+-
+-                // TODO: read minimum and maximum from Settings, and generate these values
+-                model: [-2, -1, -0.5, 0, 0.5, 1, 2]
+-
+-                onMovingChanged: {
+-                    root.exposureValueRequested(model[currentIndex]);
+-                }
+-
+-                rotation: -90
+-                visibleItemCount: 7
+-
+-                delegate: delegateComponent
+-            }
+-        }
+-    }
+-
+-    Component {
+-        id: delegateComponent
+-
+-        Item {
+-            width: Kirigami.Units.gridUnit * 2
+-            opacity: 1 - Math.abs(QQC2.Tumbler.displacement) / (QQC2.Tumbler.tumbler.visibleItemCount / 2.5)
+-
+-            QQC2.Label {
+-                anchors.centerIn: parent
+-                rotation: 90
+-                color: "white"
+-                text: modelData
+-                font.pixelSize: fontMetrics.font.pixelSize * 1.25
+-            }
++            Layout.leftMargin: Kirigami.Units.gridUnit
++            Layout.rightMargin: Kirigami.Units.gridUnit
++            from: root.camera.minimumExposureValue
++            to: root.camera.maximumExposureValue
++            value: root.camera.exposureValue
++            stepSize: 0.5
++            snapMode: QQC2.Slider.SnapAlways
++            Accessible.name: i18n("Exposure Value")
++            onMoved: root.exposureValueRequested(value)
+         }
+     }
+ }
+diff --git a/src/plasmacamera.h b/src/plasmacamera.h
+index 28e483e..868960c 100644
+--- a/src/plasmacamera.h
++++ b/src/plasmacamera.h
+@@ -67,6 +67,8 @@ class PlasmaCamera : public QObject
+     // Brightness
+     // Q_PROPERTY(int iso READ iso WRITE setIso RESET resetIso NOTIFY settingsChanged)
+     // Q_PROPERTY(int exposureTime READ exposureTime WRITE setExposureTime RESET resetExposureTime NOTIFY settingsChanged)
++    Q_PROPERTY(float minimumExposureValue READ minimumExposureValue NOTIFY settingsChanged)
++    Q_PROPERTY(float maximumExposureValue READ maximumExposureValue NOTIFY settingsChanged)
+     Q_PROPERTY(bool exposureValueAvailable READ exposureValueAvailable NOTIFY settingsChanged)
+     Q_PROPERTY(float exposureValue READ exposureValue WRITE setExposureValue RESET resetExposureValue NOTIFY settingsChanged)
+ 
+@@ -173,6 +175,8 @@ public:
+     // Brightness
+     int iso() const;
+     int exposureTime() const;
++    float minimumExposureValue() const { return m_settings.minExposureValue(); }
++    float maximumExposureValue() const { return m_settings.maxExposureValue(); }
+     bool exposureValueAvailable() const;
+     float exposureValue() const;
+ 
+diff --git a/src/plasmacamera/settings.cpp b/src/plasmacamera/settings.cpp
+index 5cdb68e..4156cd5 100644
+--- a/src/plasmacamera/settings.cpp
++++ b/src/plasmacamera/settings.cpp
+@@ -10,7 +10,8 @@ Settings::~Settings() {}
+ 
+ void Settings::load(const libcamera::ControlInfoMap &infoMap)
+ {
+-    reset();
++    // Capabilities and their ranges belong to the newly selected camera.
++    *this = Settings{};
+ 
+     qDebug() << "Loading settings:";
+     for (const auto &[controlId, controlInfo] : infoMap) {

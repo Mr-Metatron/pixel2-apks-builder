@@ -1,0 +1,1925 @@
+Subject: [PATCH] libcamera: add opt-in native Walleye PDAF autofocus
+
+diff --git a/include/libcamera/internal/camera_lens.h b/include/libcamera/internal/camera_lens.h
+index f63bcfa..6c48091 100644
+--- a/include/libcamera/internal/camera_lens.h
++++ b/include/libcamera/internal/camera_lens.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <optional>
+ #include <stdint.h>
+ #include <string>
+ 
+@@ -30,6 +31,7 @@ public:
+ 	int open();
+ 	void close();
+ 	int setFocusPosition(int32_t position);
++	std::optional<int32_t> focusPosition();
+ 
+ 	const std::string &model() const { return model_; }
+ 
+diff --git a/include/libcamera/internal/imx362_af.h b/include/libcamera/internal/imx362_af.h
+new file mode 100644
+index 0000000..b1514a8
+--- /dev/null
++++ b/include/libcamera/internal/imx362_af.h
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include <optional>
++
++#include <libcamera/control_ids.h>
++
++namespace imx362 {
++
++class PdafAf
++{
++public:
++	struct Observation {
++		double phase;
++		unsigned int window;
++	};
++
++	static constexpr float macroDioptres = 10.0f; /* Stock module specifies 0.10 m. */
++
++	void reset(int position, bool available);
++	std::optional<int> request(std::optional<int32_t> mode, std::optional<int32_t> trigger,
++				   std::optional<float> dioptres);
++	std::optional<int> sample(std::optional<Observation> observation);
++	void moved(int position);
++	void unavailable();
++
++	int32_t mode() const { return mode_; }
++	int32_t state() const { return state_; }
++	int position() const { return position_; }
++	float dioptres() const { return position_ * macroDioptres / 1023; }
++
++private:
++	void scan();
++	void fail();
++
++	struct Point {
++		Observation observation;
++		int position;
++	};
++
++	bool available_ = false;
++	int position_ = 0;
++	int32_t mode_ = libcamera::controls::AfModeManual;
++	int32_t state_ = libcamera::controls::AfStateIdle;
++	unsigned int settling_ = 0;
++	unsigned int invalid_ = 0;
++	unsigned int stable_ = 0;
++	unsigned int moves_ = 0;
++	std::optional<Point> previous_;
++	std::optional<Observation> last_;
++	std::optional<Observation> failedAt_;
++	std::optional<double> slope_;
++};
++
++} /* namespace imx362 */
+diff --git a/include/libcamera/internal/imx362_pdaf.h b/include/libcamera/internal/imx362_pdaf.h
+new file mode 100644
+index 0000000..d673d78
+--- /dev/null
++++ b/include/libcamera/internal/imx362_pdaf.h
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++#include <string>
++
++#include <libcamera/base/span.h>
++
++namespace imx362 {
++
++constexpr unsigned int width = 2016, height = 378;
++constexpr unsigned int stride = width * 2;
++
++struct Calibration {
++	std::array<uint16_t, 17 * 13> left, right;
++	std::array<uint16_t, 8 * 6> dcc;
++	unsigned int q;
++	int infinity, macro;
++
++	static std::optional<Calibration> read(libcamera::Span<const uint8_t> prefix,
++					       libcamera::Span<const uint8_t> af,
++					       libcamera::Span<const uint8_t> pd);
++	double centreCoefficient() const;
++	static std::optional<Calibration> fromDirectory(const std::string &directory);
++};
++
++struct Measurement {
++	double phase; /* Positive when the second channel is displaced to the right. */
++	double correlation;
++	double defocus;
++};
++
++constexpr double blackLevel = 64;
++constexpr double dimMean = 80;
++
++struct Analysis {
++	double mean;
++	double rmsLeft, rmsRight; /* Horizontal contrast in the phase window, in RAW10 levels. */
++	std::optional<double> temporalNoise; /* RMS difference / sqrt(2) at fixed settings. */
++	std::optional<Measurement> phase;
++
++	bool textured() const { return rmsLeft >= 4 && rmsRight >= 4; }
++};
++
++std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
++			       const Calibration *cal = nullptr,
++			       libcamera::Span<const uint8_t> previous = {});
++struct NativeAnalysis {
++	double mean;
++	/* A phase can be diagnosed in dark data or without calibration. */
++	std::optional<Measurement> candidate;
++	unsigned int window = 0;
++	bool usable = false;
++};
++
++/* Window zero is the centre. A diagnostic phase never authorises motion. */
++std::optional<NativeAnalysis> analyseNative(libcamera::Span<const uint8_t> frame,
++					    const Calibration *cal,
++					    bool diagnoseDark = false,
++					    libcamera::Span<const uint8_t> previous = {});
++std::optional<int> focusTarget(int first, double firstError, int second, double secondError);
++
++} /* namespace imx362 */
+diff --git a/include/libcamera/internal/meson.build b/include/libcamera/internal/meson.build
+index fd37513..f23baa9 100644
+--- a/include/libcamera/internal/meson.build
++++ b/include/libcamera/internal/meson.build
+@@ -25,6 +25,8 @@ libcamera_internal_headers = files([
+     'framebuffer.h',
+     'egl.h',
+     'global_configuration.h',
++    'imx362_af.h',
++    'imx362_pdaf.h',
+     'ipa_data_serializer.h',
+     'ipa_manager.h',
+     'ipa_module.h',
+diff --git a/src/apps/imx362-pdaf/main.cpp b/src/apps/imx362-pdaf/main.cpp
+index 4b522bf..a28cc78 100644
+--- a/src/apps/imx362-pdaf/main.cpp
++++ b/src/apps/imx362-pdaf/main.cpp
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+-#include "pdaf.h"
++#include "libcamera/internal/imx362_pdaf.h"
+ 
+ #include <algorithm>
+ #include <cerrno>
+diff --git a/src/apps/imx362-pdaf/meson.build b/src/apps/imx362-pdaf/meson.build
+index 1eb0680..ec6ac61 100644
+--- a/src/apps/imx362-pdaf/meson.build
++++ b/src/apps/imx362-pdaf/meson.build
+@@ -1,3 +1,3 @@
+ # SPDX-License-Identifier: CC0-1.0
+-executable('imx362-pdaf', ['main.cpp', 'pdaf.cpp'],
++executable('imx362-pdaf', 'main.cpp',
+            dependencies : libcamera_private, install : true)
+diff --git a/src/apps/imx362-pdaf/pdaf.cpp b/src/apps/imx362-pdaf/pdaf.cpp
+deleted file mode 100644
+index b05f365..0000000
+--- a/src/apps/imx362-pdaf/pdaf.cpp
++++ /dev/null
+@@ -1,189 +0,0 @@
+-// SPDX-License-Identifier: LGPL-2.1-or-later
+-#include "pdaf.h"
+-
+-#include <algorithm>
+-#include <cmath>
+-
+-namespace imx362 {
+-
+-std::optional<Calibration> Calibration::read(libcamera::Span<const uint8_t> prefix,
+-					     libcamera::Span<const uint8_t> af,
+-					     libcamera::Span<const uint8_t> pd)
+-{
+-	if (prefix.size() != 2 || af.size() != 8 || pd.size() != 0x3e4)
+-		return {};
+-	const unsigned int flip = prefix[0] || prefix[1] ? 3 : 0;
+-	auto word = [flip](auto cell, unsigned int n) {
+-		return (cell[n ^ flip] << 8) | cell[(n + 1) ^ flip];
+-	};
+-	auto checksum = [&](auto cell, unsigned int end) {
+-		uint16_t sum = 0;
+-		for (unsigned int i = 0; i < end; ++i)
+-			sum += cell[i ^ flip];
+-		return sum == word(cell, end);
+-	};
+-	/* Offsets here are relative to the PD cell at module address 0x764. */
+-	if (!checksum(af, 6) || !checksum(pd, 0x3e0) ||
+-	    word(pd, 2) != 17 || word(pd, 4) != 13 ||
+-	    word(pd, 0x37c) != 8 || word(pd, 0x37e) != 6)
+-		return {};
+-
+-	Calibration cal;
+-	cal.infinity = static_cast<int16_t>(word(af, 0)) / 16;
+-	cal.macro = static_cast<int16_t>(word(af, 4)) / 16;
+-	cal.q = word(pd, 0x37a);
+-	if (cal.infinity == cal.macro || cal.q > 12)
+-		return {};
+-
+-	/* The vendor fills all three destination grids in reverse order. */
+-	for (unsigned int i = 0; i < cal.left.size(); ++i) {
+-		unsigned int n = (cal.left.size() - 1 - i) * 2;
+-		cal.left[i] = word(pd, 0x6 + n);
+-		cal.right[i] = word(pd, 0x1c0 + n);
+-	}
+-	for (unsigned int i = 0; i < cal.dcc.size(); ++i)
+-		cal.dcc[i] = word(pd, 0x380 + (cal.dcc.size() - 1 - i) * 2) >> 4;
+-
+-	if (!cal.centreCoefficient())
+-		return {};
+-	return cal;
+-}
+-
+-double Calibration::centreCoefficient() const
+-{
+-	/* The stock 2PD routine averages the four surrounding knots, then
+-	 * performs integer division by 2^Q. Use the centre of the frame.
+-	 */
+-	unsigned int sum = dcc[2 * 8 + 3] + dcc[2 * 8 + 4] +
+-			   dcc[3 * 8 + 3] + dcc[3 * 8 + 4];
+-	return (sum / 4) >> q;
+-}
+-
+-namespace {
+-
+-/* The phase matcher compares nine rows of 112 pairs around the optical centre. */
+-constexpr int radius = 8, halfWindow = 48, count = 2 * (halfWindow + radius);
+-constexpr int firstRow = height / 2 - 32, lastRow = height / 2 + 32, step = 8;
+-constexpr int firstPair = width / 4 - count / 2;
+-
+-unsigned int sample(libcamera::Span<const uint8_t> frame, size_t offset)
+-{
+-	return frame[offset] | frame[offset + 1] << 8;
+-}
+-
+-double windowContrast(libcamera::Span<const uint8_t> frame, unsigned int channel)
+-{
+-	double variance = 0;
+-	for (int y = firstRow; y <= lastRow; y += step) {
+-		double sum = 0, squares = 0;
+-		for (int x = firstPair; x < firstPair + count; ++x) {
+-			double v = sample(frame, y * stride + 4 * x + 2 * channel);
+-			sum += v;
+-			squares += v * v;
+-		}
+-		variance += squares - sum * sum / count;
+-	}
+-	return std::sqrt(variance / (count * (1 + (lastRow - firstRow) / step)));
+-}
+-
+-std::optional<Measurement> match(const Calibration &cal, libcamera::Span<const uint8_t> frame)
+-{
+-	struct Sums { double a, b, aa, bb, ab; };
+-	std::array<Sums, 2 * radius + 1> sums{};
+-	unsigned int samples = 0;
+-	for (int y = firstRow; y <= lastRow; y += step) {
+-		std::array<double, count> a, b;
+-		for (int i = 0; i < count; ++i) {
+-			const int x = firstPair + i;
+-			const unsigned int off = y * stride + 4 * x;
+-			/* Use the nearest factory gain knot for each sampled pair. */
+-			int knot = std::lround(12.0 * y / (height - 1)) * 17 +
+-				   std::lround(16.0 * x / (width / 2 - 1));
+-			if (!cal.left[knot] || !cal.right[knot])
+-				return {};
+-			a[i] = std::max<double>(sample(frame, off) - blackLevel, 0);
+-			b[i] = std::max<double>(sample(frame, off + 2) - blackLevel, 0);
+-			a[i] *= cal.left[knot];
+-			b[i] *= cal.right[knot];
+-		}
+-		for (int d = -radius; d <= radius; ++d) {
+-			auto &s = sums[d + radius];
+-			for (int i = radius; i < count - radius; ++i) {
+-				double l = a[i], r = b[i + d];
+-				s.a += l;
+-				s.b += r;
+-				s.aa += l * l;
+-				s.bb += r * r;
+-				s.ab += l * r;
+-			}
+-		}
+-		samples += count - 2 * radius;
+-	}
+-	std::array<double, sums.size()> corr;
+-	for (unsigned int i = 0; i < corr.size(); ++i) {
+-		const auto &s = sums[i];
+-		double va = s.aa - s.a * s.a / samples;
+-		double vb = s.bb - s.b * s.b / samples;
+-		if (va <= 0 || vb <= 0)
+-			return {};
+-		corr[i] = (s.ab - s.a * s.b / samples) / std::sqrt(va * vb);
+-	}
+-	int peak = std::max_element(corr.begin(), corr.end()) - corr.begin();
+-	if (!peak || peak == 2 * radius || corr[peak] < 0.8)
+-		return {};
+-	for (int i = 0; i <= 2 * radius; ++i)
+-		if (std::abs(i - peak) > 1 && corr[i] >= corr[peak] - 0.025)
+-			return {};
+-	double curvature = 2 * corr[peak] - corr[peak - 1] - corr[peak + 1];
+-	if (curvature <= 0)
+-		return {};
+-	double phase = peak - radius + 0.5 * (corr[peak + 1] - corr[peak - 1]) / curvature;
+-	return Measurement{ phase, corr[peak], phase * cal.centreCoefficient() };
+-}
+-
+-} /* namespace */
+-
+-std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
+-			       const Calibration *cal,
+-			       libcamera::Span<const uint8_t> previous)
+-{
+-	if (frame.size() != stride * height ||
+-	    (!previous.empty() && previous.size() != frame.size()))
+-		return {};
+-
+-	uint64_t sum = 0, squaredDifferences = 0;
+-	for (size_t i = 0; i < frame.size(); i += 2) {
+-		int v = sample(frame, i);
+-		if (v > 1023)
+-			return {};
+-		sum += v;
+-		if (!previous.empty()) {
+-			int p = sample(previous, i);
+-			if (p > 1023)
+-				return {};
+-			squaredDifferences += (v - p) * (v - p);
+-		}
+-	}
+-	Analysis a{};
+-	const double pixels = width * height;
+-	a.mean = sum / pixels;
+-	a.rmsLeft = windowContrast(frame, 0);
+-	a.rmsRight = windowContrast(frame, 1);
+-	if (!previous.empty())
+-		a.temporalNoise = std::sqrt(squaredDifferences / (2 * pixels));
+-	if (cal && a.textured())
+-		a.phase = match(*cal, frame);
+-	return a;
+-}
+-
+-std::optional<int> focusTarget(int first, double firstError, int second, double secondError)
+-{
+-	if (first == second || firstError == secondError)
+-		return {};
+-	double target = second - secondError * (second - first) / (secondError - firstError);
+-	if (!std::isfinite(target) || target < 0 || target > 1023)
+-		return {};
+-	return std::lround(target);
+-}
+-
+-} /* namespace imx362 */
+diff --git a/src/apps/imx362-pdaf/pdaf.h b/src/apps/imx362-pdaf/pdaf.h
+deleted file mode 100644
+index 7252a9b..0000000
+--- a/src/apps/imx362-pdaf/pdaf.h
++++ /dev/null
+@@ -1,50 +0,0 @@
+-// SPDX-License-Identifier: LGPL-2.1-or-later
+-#pragma once
+-
+-#include <array>
+-#include <cstdint>
+-#include <optional>
+-
+-#include <libcamera/base/span.h>
+-
+-namespace imx362 {
+-
+-constexpr unsigned int width = 2016, height = 378;
+-constexpr unsigned int stride = width * 2;
+-
+-struct Calibration {
+-	std::array<uint16_t, 17 * 13> left, right;
+-	std::array<uint16_t, 8 * 6> dcc;
+-	unsigned int q;
+-	int infinity, macro;
+-
+-	static std::optional<Calibration> read(libcamera::Span<const uint8_t> prefix,
+-					       libcamera::Span<const uint8_t> af,
+-					       libcamera::Span<const uint8_t> pd);
+-	double centreCoefficient() const;
+-};
+-
+-struct Measurement {
+-	double phase; /* Positive when the second channel is displaced to the right. */
+-	double correlation;
+-	double defocus;
+-};
+-
+-constexpr double blackLevel = 64;
+-constexpr double dimMean = 80;
+-
+-struct Analysis {
+-	double mean;
+-	double rmsLeft, rmsRight; /* Horizontal contrast in the phase window, in RAW10 levels. */
+-	std::optional<double> temporalNoise; /* RMS difference / sqrt(2) at fixed settings. */
+-	std::optional<Measurement> phase;
+-
+-	bool textured() const { return rmsLeft >= 4 && rmsRight >= 4; }
+-};
+-
+-std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
+-			       const Calibration *cal = nullptr,
+-			       libcamera::Span<const uint8_t> previous = {});
+-std::optional<int> focusTarget(int first, double firstError, int second, double secondError);
+-
+-} /* namespace imx362 */
+diff --git a/src/libcamera/camera_lens.cpp b/src/libcamera/camera_lens.cpp
+index 96221e2..4ce3a78 100644
+--- a/src/libcamera/camera_lens.cpp
++++ b/src/libcamera/camera_lens.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "libcamera/internal/camera_lens.h"
+ 
++#include <array>
++
+ #include <libcamera/base/utils.h>
+ 
+ #include "libcamera/internal/v4l2_subdevice.h"
+@@ -120,6 +122,19 @@ int CameraLens::setFocusPosition(int32_t position)
+ 	return 0;
+ }
+ 
++/**
++ * \brief Read the current absolute actuator command
++ * \return The V4L2 position, or no value on error
++ */
++std::optional<int32_t> CameraLens::focusPosition()
++{
++	const std::array<uint32_t, 1> ids{ V4L2_CID_FOCUS_ABSOLUTE };
++	ControlList result = subdev_->getControls(ids);
++	if (!result.contains(V4L2_CID_FOCUS_ABSOLUTE))
++		return {};
++	return result.get(V4L2_CID_FOCUS_ABSOLUTE).get<int32_t>();
++}
++
+ int CameraLens::validateLensDriver()
+ {
+ 	int ret = 0;
+diff --git a/src/libcamera/imx362_af.cpp b/src/libcamera/imx362_af.cpp
+new file mode 100644
+index 0000000..59ff58f
+--- /dev/null
++++ b/src/libcamera/imx362_af.cpp
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "libcamera/internal/imx362_af.h"
++
++#include <algorithm>
++#include <cmath>
++
++using namespace libcamera::controls;
++
++namespace imx362 {
++
++namespace {
++
++constexpr double focusDeadband = 0.25;
++constexpr double relockThreshold = 0.65;
++/* Units are phase samples per normalised V4L2 actuator step. */
++constexpr double maximumSlope = 0.025;
++constexpr double minimumSlope = 0.001;
++constexpr unsigned int confirmationFrames = 2;
++constexpr unsigned int retriggerFrames = 3;
++constexpr unsigned int invalidLimit = 8;
++constexpr unsigned int moveLimit = 16;
++constexpr int maxPosition = 1023;
++
++} /* namespace */
++
++void PdafAf::reset(int position, bool available)
++{
++	*this = PdafAf{};
++	position_ = std::clamp(position, 0, maxPosition);
++	available_ = available;
++}
++
++void PdafAf::scan()
++{
++	state_ = available_ ? AfStateScanning : AfStateFailed;
++	stable_ = 0;
++	invalid_ = 0;
++	moves_ = 0;
++	previous_.reset();
++	last_.reset();
++	failedAt_.reset();
++	slope_.reset();
++}
++
++void PdafAf::fail()
++{
++	state_ = AfStateFailed;
++	stable_ = 0;
++	failedAt_ = last_;
++	last_.reset();
++}
++
++std::optional<int> PdafAf::request(std::optional<int32_t> mode,
++				   std::optional<int32_t> trigger,
++				   std::optional<float> dioptres)
++{
++	if (mode && *mode >= AfModeManual && *mode <= AfModeContinuous && *mode != mode_) {
++		mode_ = *mode;
++		if (mode_ == AfModeContinuous)
++			scan();
++		else
++			state_ = AfStateIdle;
++	}
++
++	if (mode_ == AfModeManual && dioptres && std::isfinite(*dioptres)) {
++		const float clamped = std::clamp(*dioptres, 0.0f, macroDioptres);
++		return std::lround(clamped * maxPosition / macroDioptres);
++	}
++
++	if (mode_ == AfModeAuto) {
++		if (trigger == AfTriggerStart && state_ != AfStateScanning)
++			scan();
++		else if (trigger == AfTriggerCancel && state_ == AfStateScanning)
++			state_ = AfStateIdle;
++	}
++	return {};
++}
++
++void PdafAf::moved(int position)
++{
++	position_ = position;
++	settling_ = 3;
++}
++
++void PdafAf::unavailable()
++{
++	available_ = false;
++	if (mode_ != AfModeManual && state_ != AfStateIdle)
++		fail();
++}
++
++std::optional<int> PdafAf::sample(std::optional<Observation> observation)
++{
++	if (!available_ || mode_ == AfModeManual || state_ == AfStateIdle ||
++	    (mode_ == AfModeAuto && state_ != AfStateScanning))
++		return {};
++	if (settling_) {
++		--settling_;
++		return {};
++	}
++
++	if (!observation || !std::isfinite(observation->phase)) {
++		stable_ = 0;
++		last_.reset();
++		if (state_ != AfStateFailed && ++invalid_ == invalidLimit)
++			fail();
++		return {};
++	}
++	invalid_ = 0;
++
++	const double phase = observation->phase;
++	const double magnitude = std::abs(phase);
++	const bool sameWindow = last_ && last_->window == observation->window;
++	const bool sameDirection = last_ && std::signbit(last_->phase) == std::signbit(phase);
++	last_ = observation;
++
++	if (state_ != AfStateScanning) {
++		const bool changed = !failedAt_ || failedAt_->window != observation->window ||
++				     std::abs(phase - failedAt_->phase) >= relockThreshold;
++		const bool retry = state_ == AfStateFailed ? changed : magnitude >= relockThreshold;
++		stable_ = retry ? (sameWindow && sameDirection ? stable_ + 1 : 1) : 0;
++		if (stable_ >= retriggerFrames)
++			scan();
++		return {};
++	}
++
++	if (magnitude <= focusDeadband) {
++		stable_ = sameWindow ? stable_ + 1 : 1;
++		if (stable_ == confirmationFrames) {
++			state_ = AfStateFocused;
++			stable_ = 0;
++		}
++		return {};
++	}
++	stable_ = 0;
++
++	if (previous_ && previous_->observation.window != observation->window) {
++		/* A different depth target invalidates the secant estimate. */
++		previous_.reset();
++		slope_.reset();
++	}
++	if (!previous_ && (!sameWindow || !sameDirection))
++		return {};
++
++	if (previous_ && position_ != previous_->position) {
++		const double delta = (phase - previous_->observation.phase) /
++				     (position_ - previous_->position);
++		if (delta < minimumSlope || delta > maximumSlope) {
++			fail();
++			return {};
++		}
++		/* Use the larger estimate when the measured response gets steeper. */
++		slope_ = slope_ ? std::max(delta, *slope_) : delta;
++	}
++	if (moves_ == moveLimit) {
++		fail();
++		return {};
++	}
++
++	/* Use a small probe until the sign and scale are measured on this target.
++	 * The damped secant step cannot jump across the predicted focal point. */
++	const double response = slope_.value_or(maximumSlope);
++	const int limit = slope_ ? 64 : 24;
++	const int step = std::clamp(int(std::floor(0.65 * magnitude / response)), 1, limit);
++	const int target = std::clamp(position_ + (phase > 0 ? -step : step), 0, maxPosition);
++	if (target == position_) {
++		fail();
++		return {};
++	}
++	previous_ = Point{ *observation, position_ };
++	++moves_;
++
++	return target;
++}
++
++} /* namespace imx362 */
+diff --git a/src/libcamera/imx362_pdaf.cpp b/src/libcamera/imx362_pdaf.cpp
+new file mode 100644
+index 0000000..c402af3
+--- /dev/null
++++ b/src/libcamera/imx362_pdaf.cpp
+@@ -0,0 +1,329 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "libcamera/internal/imx362_pdaf.h"
++
++#include <algorithm>
++#include <cmath>
++#include <fstream>
++
++namespace imx362 {
++
++std::optional<Calibration> Calibration::read(libcamera::Span<const uint8_t> prefix,
++					     libcamera::Span<const uint8_t> af,
++					     libcamera::Span<const uint8_t> pd)
++{
++	if (prefix.size() != 2 || af.size() != 8 || pd.size() != 0x3e4)
++		return {};
++	const unsigned int flip = prefix[0] || prefix[1] ? 3 : 0;
++	auto word = [flip](auto cell, unsigned int n) {
++		return (cell[n ^ flip] << 8) | cell[(n + 1) ^ flip];
++	};
++	auto checksum = [&](auto cell, unsigned int end) {
++		uint16_t sum = 0;
++		for (unsigned int i = 0; i < end; ++i)
++			sum += cell[i ^ flip];
++		return sum == word(cell, end);
++	};
++	/* Offsets here are relative to the PD cell at module address 0x764. */
++	if (!checksum(af, 6) || !checksum(pd, 0x3e0) ||
++	    word(pd, 2) != 17 || word(pd, 4) != 13 ||
++	    word(pd, 0x37c) != 8 || word(pd, 0x37e) != 6)
++		return {};
++
++	Calibration cal;
++	cal.infinity = static_cast<int16_t>(word(af, 0)) / 16;
++	cal.macro = static_cast<int16_t>(word(af, 4)) / 16;
++	cal.q = word(pd, 0x37a);
++	if (cal.infinity == cal.macro || cal.q > 12)
++		return {};
++
++	/* The vendor fills all three destination grids in reverse order. */
++	for (unsigned int i = 0; i < cal.left.size(); ++i) {
++		unsigned int n = (cal.left.size() - 1 - i) * 2;
++		cal.left[i] = word(pd, 0x6 + n);
++		cal.right[i] = word(pd, 0x1c0 + n);
++	}
++	for (unsigned int i = 0; i < cal.dcc.size(); ++i)
++		cal.dcc[i] = word(pd, 0x380 + (cal.dcc.size() - 1 - i) * 2) >> 4;
++
++	if (!cal.centreCoefficient())
++		return {};
++	return cal;
++}
++
++std::optional<Calibration> Calibration::fromDirectory(const std::string &directory)
++{
++	auto readCell = [&](const char *name, libcamera::Span<uint8_t> bytes) {
++		std::ifstream file(directory + '/' + name, std::ios::binary);
++		return bool(file.read(reinterpret_cast<char *>(bytes.data()), bytes.size())) &&
++		       file.peek() == EOF;
++	};
++	std::array<uint8_t, 2> prefix;
++	std::array<uint8_t, 8> af;
++	std::array<uint8_t, 0x3e4> pd;
++	if (!readCell("module-prefix@0,0", prefix) || !readCell("af-calibration@758,0", af) ||
++	    !readCell("pdaf-calibration@764,0", pd))
++		return {};
++	return read(prefix, af, pd);
++}
++
++double Calibration::centreCoefficient() const
++{
++	/* The stock 2PD routine averages the four surrounding knots, then
++	 * performs integer division by 2^Q. Use the centre of the frame.
++	 */
++	unsigned int sum = dcc[2 * 8 + 3] + dcc[2 * 8 + 4] +
++			   dcc[3 * 8 + 3] + dcc[3 * 8 + 4];
++	return (sum / 4) >> q;
++}
++
++namespace {
++
++/* All offsets are in pairs of left/right samples. */
++constexpr int radius = 8;
++struct Window {
++	int x, y, halfWidth, halfHeight, rowStep;
++};
++constexpr Window centre{ width / 4, height / 2, 48, 32, 8 };
++constexpr std::array<Window, 5> windows{
++	centre, Window{ width / 4 - 126, height / 2, 54, 76, 4 },
++	Window{ width / 4 + 126, height / 2, 54, 76, 4 },
++	Window{ width / 4, height / 2 - 76, 54, 38, 4 },
++	Window{ width / 4, height / 2 + 76, 54, 38, 4 },
++};
++
++unsigned int sample(libcamera::Span<const uint8_t> frame, size_t offset)
++{
++	return frame[offset] | frame[offset + 1] << 8;
++}
++
++double windowContrast(libcamera::Span<const uint8_t> frame, unsigned int channel)
++{
++	constexpr int count = 2 * (centre.halfWidth + radius);
++	double variance = 0;
++	for (int y = centre.y - centre.halfHeight; y <= centre.y + centre.halfHeight;
++	     y += centre.rowStep) {
++		double sum = 0, squares = 0;
++		for (int x = centre.x - count / 2; x < centre.x + count / 2; ++x) {
++			double v = sample(frame, y * stride + 4 * x + 2 * channel);
++			sum += v;
++			squares += v * v;
++		}
++		variance += squares - sum * sum / count;
++	}
++	return std::sqrt(variance / (count * (1 + 2 * centre.halfHeight / centre.rowStep)));
++}
++
++struct Sums {
++	double a = 0, b = 0, aa = 0, bb = 0, ab = 0;
++
++	void add(double l, double r)
++	{
++		a += l;
++		b += r;
++		aa += l * l;
++		bb += r * r;
++		ab += l * r;
++	}
++
++	void addRow(const Sums &row, int samples, bool removeRowMean)
++	{
++		a += row.a;
++		b += row.b;
++		aa += row.aa - (removeRowMean ? row.a * row.a / samples : 0);
++		bb += row.bb - (removeRowMean ? row.b * row.b / samples : 0);
++		ab += row.ab - (removeRowMean ? row.a * row.b / samples : 0);
++	}
++};
++
++constexpr std::array<int, 7> weights{ 1, 4, 8, 10, 8, 4, 1 };
++constexpr int smoothingRadius = weights.size() / 2;
++constexpr int maxCount = 2 * (54 + radius);
++
++void smoothRow(libcamera::Span<const uint8_t> frame, int y, int first, int count,
++	       std::array<double, maxCount> &left, std::array<double, maxCount> &right)
++{
++	std::array<unsigned int, maxCount + 2 * smoothingRadius> verticalL{}, verticalR{};
++	for (int dy = -smoothingRadius; dy <= smoothingRadius; ++dy) {
++		const int row = (y + dy) * stride + (first - smoothingRadius) * 4;
++		const int weight = weights[dy + smoothingRadius];
++		for (int i = 0; i < count + 2 * smoothingRadius; ++i) {
++			verticalL[i] += weight * sample(frame, row + 4 * i);
++			verticalR[i] += weight * sample(frame, row + 4 * i + 2);
++		}
++	}
++	for (int i = 0; i < count; ++i) {
++		unsigned int l = 0, r = 0;
++		for (unsigned int k = 0; k < weights.size(); ++k) {
++			l += weights[k] * verticalL[i + k];
++			r += weights[k] * verticalR[i + k];
++		}
++		left[i] = l / 1296.0;
++		right[i] = r / 1296.0;
++	}
++}
++
++std::optional<Measurement> match(const Calibration *cal, libcamera::Span<const uint8_t> frame,
++				 const Window &window, bool native, bool requireContrast)
++{
++	const int count = 2 * (window.halfWidth + radius);
++	const int first = window.x - count / 2;
++	const int rowSamples = count - 2 * radius;
++	std::array<Sums, 2 * radius + 1> sums{};
++	Sums rawContrast;
++	int samples = 0;
++	for (int y = window.y - window.halfHeight; y <= window.y + window.halfHeight;
++	     y += window.rowStep) {
++		std::array<double, maxCount> a, b;
++		if (native)
++			smoothRow(frame, y, first, count, a, b);
++		else
++			for (int i = 0; i < count; ++i) {
++				const int off = y * stride + 4 * (first + i);
++				a[i] = sample(frame, off);
++				b[i] = sample(frame, off + 2);
++			}
++
++		Sums rawRow;
++		for (int i = 0; i < count; ++i) {
++			rawRow.add(a[i], b[i]);
++			if (!cal)
++				continue;
++			const int x = first + i;
++			/* Match the r8 gain lookup and preserve its RAW10 black level. */
++			const int knot = std::lround(12.0 * y / (height - 1)) * 17 +
++					 std::lround(16.0 * x / (width / 2 - 1));
++			if (!cal->left[knot] || !cal->right[knot])
++				return {};
++			a[i] = std::max(a[i] - blackLevel, 0.0) * cal->left[knot];
++			b[i] = std::max(b[i] - blackLevel, 0.0) * cal->right[knot];
++		}
++		rawContrast.addRow(rawRow, count, true);
++
++		for (int d = -radius; d <= radius; ++d) {
++			Sums row;
++			for (int i = radius; i < count - radius; ++i)
++				row.add(a[i], b[i + d]);
++			sums[d + radius].addRow(row, rowSamples, native);
++		}
++		samples += rowSamples;
++	}
++	if (requireContrast) {
++		const double minimumVariance = 16.0 * count * samples / rowSamples;
++		if (rawContrast.aa < minimumVariance || rawContrast.bb < minimumVariance)
++			return {};
++	}
++
++	std::array<double, sums.size()> corr;
++	for (unsigned int i = 0; i < corr.size(); ++i) {
++		const auto &s = sums[i];
++		const double va = s.aa - (native ? 0 : s.a * s.a / samples);
++		const double vb = s.bb - (native ? 0 : s.b * s.b / samples);
++		if (va <= 0 || vb <= 0)
++			return {};
++		corr[i] = (s.ab - (native ? 0 : s.a * s.b / samples)) / std::sqrt(va * vb);
++	}
++	const int peak = std::max_element(corr.begin(), corr.end()) - corr.begin();
++	if (!peak || peak == 2 * radius || corr[peak] < 0.8)
++		return {};
++	for (int i = 0; i <= 2 * radius; ++i) {
++		const bool competingPeak = !native ||
++			((!i || corr[i] >= corr[i - 1]) &&
++			 (i == 2 * radius || corr[i] >= corr[i + 1]));
++		if (competingPeak && std::abs(i - peak) > 1 && corr[i] >= corr[peak] - 0.025)
++			return {};
++	}
++	const double curvature = 2 * corr[peak] - corr[peak - 1] - corr[peak + 1];
++	if (curvature <= (native ? 0.003 : 0))
++		return {};
++	const double phase = peak - radius + 0.5 * (corr[peak + 1] - corr[peak - 1]) / curvature;
++	return Measurement{ phase, corr[peak], cal ? phase * cal->centreCoefficient() : 0.0 };
++}
++
++std::optional<Analysis> frameStatistics(libcamera::Span<const uint8_t> frame,
++					libcamera::Span<const uint8_t> previous)
++{
++	if (frame.size() != stride * height ||
++	    (!previous.empty() && previous.size() != frame.size()))
++		return {};
++
++	uint64_t sum = 0, squaredDifferences = 0;
++	for (size_t i = 0; i < frame.size(); i += 2) {
++		int v = sample(frame, i);
++		if (v > 1023)
++			return {};
++		sum += v;
++		if (!previous.empty()) {
++			int p = sample(previous, i);
++			if (p > 1023)
++				return {};
++			squaredDifferences += (v - p) * (v - p);
++		}
++	}
++	Analysis a{};
++	const double pixels = width * height;
++	a.mean = sum / pixels;
++	if (!previous.empty())
++		a.temporalNoise = std::sqrt(squaredDifferences / (2 * pixels));
++	return a;
++}
++
++} /* namespace */
++
++std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
++			       const Calibration *cal,
++			       libcamera::Span<const uint8_t> previous)
++{
++	auto stats = frameStatistics(frame, previous);
++	if (!stats)
++		return {};
++	auto &a = *stats;
++	a.rmsLeft = windowContrast(frame, 0);
++	a.rmsRight = windowContrast(frame, 1);
++	if (cal && a.textured())
++		a.phase = match(cal, frame, centre, false, false);
++	return a;
++}
++
++std::optional<NativeAnalysis> analyseNative(libcamera::Span<const uint8_t> frame,
++					    const Calibration *cal, bool diagnoseDark,
++					    libcamera::Span<const uint8_t> previous)
++{
++	auto stats = frameStatistics(frame, previous);
++	if (!stats)
++		return {};
++	NativeAnalysis result{};
++	result.mean = stats->mean;
++	const bool bright = result.mean >= dimMean;
++	/* Reuse r8's fixed-setting noise estimate. A change large enough to
++	 * halve signal-to-noise is also unsafe as a phase observation. */
++	const bool adequateSnr = stats->temporalNoise &&
++				 stats->mean - blackLevel >= 2 * *stats->temporalNoise;
++	if ((!cal || !bright || !adequateSnr) && !diagnoseDark)
++		return result;
++
++	for (unsigned int i = 0; i < windows.size(); ++i) {
++		auto candidate = match(cal, frame, windows[i], true, bright);
++		if (!candidate)
++			continue;
++		if (!result.candidate || candidate->correlation > result.candidate->correlation) {
++			result.candidate = candidate;
++			result.window = i;
++		}
++		if (!i)
++			break;
++	}
++	result.usable = result.candidate && cal && bright && adequateSnr;
++	return result;
++}
++
++std::optional<int> focusTarget(int first, double firstError, int second, double secondError)
++{
++	if (first == second || firstError == secondError)
++		return {};
++	double target = second - secondError * (second - first) / (secondError - firstError);
++	if (!std::isfinite(target) || target < 0 || target > 1023)
++		return {};
++	return std::lround(target);
++}
++
++} /* namespace imx362 */
+diff --git a/src/libcamera/meson.build b/src/libcamera/meson.build
+index 6aedacb..f95d4c3 100644
+--- a/src/libcamera/meson.build
++++ b/src/libcamera/meson.build
+@@ -32,6 +32,8 @@ libcamera_internal_sources = files([
+     'dma_buf_allocator.cpp',
+     'formats.cpp',
+     'global_configuration.cpp',
++    'imx362_af.cpp',
++    'imx362_pdaf.cpp',
+     'ipa_controls.cpp',
+     'ipa_data_serializer.cpp',
+     'ipa_interface.cpp',
+diff --git a/src/libcamera/pipeline/simple/meson.build b/src/libcamera/pipeline/simple/meson.build
+index 1150cf3..b248237 100644
+--- a/src/libcamera/pipeline/simple/meson.build
++++ b/src/libcamera/pipeline/simple/meson.build
+@@ -3,4 +3,5 @@
+ libcamera_internal_sources += files([
+     'autofocus.cpp',
+     'simple.cpp',
++    'walleye_pdaf.cpp',
+ ])
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 7ab339a..62f529c 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -51,6 +51,7 @@
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
+ #include "autofocus.h"
++#include "walleye_pdaf.h"
+ 
+ namespace libcamera {
+ 
+@@ -284,7 +285,7 @@ class SimpleCameraData : public Camera::Private
+ {
+ public:
+ 	SimpleCameraData(SimplePipelineHandler *pipe,
+-			 unsigned int numStreams,
++			 unsigned int numStreams, MediaDevice *media,
+ 			 MediaEntity *sensor);
+ 
+ 	bool isValid() const { return sensor_ != nullptr; }
+@@ -366,6 +367,8 @@ public:
+ 	std::unique_ptr<Converter> converter_;
+ 	std::unique_ptr<SoftwareIsp> swIsp_;
+ 	std::optional<SimpleAutofocus> autofocus_;
++	std::unique_ptr<WalleyePdaf> pdaf_;
++	bool pdafBinnedRoute_ = false;
+ 	SimpleFrames frameInfo_;
+ 
+ private:
+@@ -474,7 +477,7 @@ private:
+  */
+ 
+ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+-				   unsigned int numStreams,
++				   unsigned int numStreams, MediaDevice *media,
+ 				   MediaEntity *sensor)
+ 	: Camera::Private(pipe), streams_(numStreams), rawStream_(nullptr)
+ {
+@@ -572,6 +575,18 @@ SimpleCameraData::SimpleCameraData(SimplePipelineHandler *pipe,
+ 	if (!sensor_)
+ 		return;
+ 
++	if (WalleyePdaf::enabled(media, sensor)) {
++		CameraLens *lens = sensor_->focusLens();
++		if (lens) {
++			const auto range = lens->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
++			if (lens->model() != "lc898214xd" || range == lens->controls().end() ||
++			    !range->first->isInput() || range->second.min().get<int32_t>() != 0 ||
++			    range->second.max().get<int32_t>() != 1023)
++				lens = nullptr;
++		}
++		pdaf_ = std::make_unique<WalleyePdaf>(media, lens);
++	}
++
+ 	const CameraSensorProperties::SensorDelays &delays = sensor_->sensorDelays();
+ 	std::unordered_map<uint32_t, DelayedControls::ControlParams> params = {
+ 		{ V4L2_CID_ANALOGUE_GAIN, { delays.gainDelay, false } },
+@@ -636,9 +651,14 @@ int SimpleCameraData::init()
+ 		}
+ 	}
+ 
++	if (pdaf_) {
++		ControlInfoMap::Map ctrls(controlInfo_.begin(), controlInfo_.end());
++		pdaf_->addControls(ctrls);
++		controlInfo_ = ControlInfoMap(std::move(ctrls), controls::controls);
++	}
+ 	if (CameraLens *lens = sensor_->focusLens()) {
+ 		auto range = lens->controls().find(V4L2_CID_FOCUS_ABSOLUTE);
+-		if (swIsp_ && range != lens->controls().end() && range->first->isInput() &&
++		if (!pdaf_ && swIsp_ && range != lens->controls().end() && range->first->isInput() &&
+ 		    range->second.min().get<int32_t>() < range->second.max().get<int32_t>()) {
+ 			autofocus_.emplace(lens, range->second);
+ 			ControlInfoMap::Map ctrls(controlInfo_.begin(), controlInfo_.end());
+@@ -951,6 +971,9 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 		return;
+ 	}
+ 
++	if (pdaf_)
++		pdaf_->mainFrameReady();
++
+ 	/*
+ 	 * Record the sensor's timestamp in the request metadata. The request
+ 	 * needs to be obtained from the user-facing buffer, as internal
+@@ -979,7 +1002,10 @@ void SimpleCameraData::imageBufferReady(FrameBuffer *buffer)
+ 			SimpleFrameInfo *info = frameInfo_.find(request->sequence());
+ 			info->sensorControls = delayedCtrls_->get(buffer->metadata().sequence);
+ 		}
+-		if (useConversion_ && autofocus_) {
++		if (pdaf_) {
++			pdaf_->request(request->controls());
++			pdaf_->metadata(metadata);
++		} else if (useConversion_ && autofocus_) {
+ 			autofocus_->request(request->controls());
+ 			autofocus_->capture(timestamp, metadata);
+ 		}
+@@ -1569,6 +1595,15 @@ int SimplePipelineHandler::configure(Camera *camera, CameraConfiguration *c)
+ 		return ret;
+ 
+ 	const SimpleCameraData::Configuration *pipeConfig = config->pipeConfig();
++	data->pdafBinnedRoute_ = data->pdaf_ && pipeConfig->sensorSize == Size(2016, 1512) &&
++		data->entities_.back().entity->name() == "msm_vfe0_video0" &&
++		std::any_of(data->entities_.begin(), data->entities_.end(),
++			    [](const SimpleCameraData::Entity &entity) {
++				    return entity.entity->name() == "msm_csid0" &&
++					   entity.source && entity.source->index() == 1 &&
++					   entity.sourceLink->sink()->entity()->name() == "msm_ispif0";
++			    });
++
+ 	V4L2SubdeviceFormat format{};
+ 	format.code = pipeConfig->code;
+ 	format.size = pipeConfig->sensorSize;
+@@ -1728,6 +1763,9 @@ int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ 						      &DelayedControls::applyControls);
+ 	}
+ 
++	if (data->pdaf_)
++		data->pdaf_->prepare(data->pdafBinnedRoute_);
++
+ 	ret = video->streamOn();
+ 	if (ret < 0) {
+ 		stop(camera);
+@@ -1753,7 +1791,9 @@ int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ 				video->queueBuffer(buffer.get());
+ 	}
+ 
+-	if (data->autofocus_ && controls)
++	if (data->pdaf_)
++		data->pdaf_->start(controls);
++	else if (data->autofocus_ && controls)
+ 		data->autofocus_->request(*controls);
+ 
+ 	return 0;
+@@ -1782,6 +1822,8 @@ void SimplePipelineHandler::stopDevice(Camera *camera)
+ 	}
+ 
+ 	video->streamOff();
++	if (data->pdaf_)
++		data->pdaf_->stop();
+ 	video->releaseBuffers();
+ 
+ 	video->bufferReady.disconnect(data, &SimpleCameraData::imageBufferReady);
+@@ -2008,7 +2050,7 @@ bool SimplePipelineHandler::matchDevice(std::shared_ptr<MediaDevice> media,
+ 
+ 	for (MediaEntity *sensor : sensors) {
+ 		std::unique_ptr<SimpleCameraData> data =
+-			std::make_unique<SimpleCameraData>(this, numStreams, sensor);
++			std::make_unique<SimpleCameraData>(this, numStreams, media.get(), sensor);
+ 		if (!data->isValid()) {
+ 			LOG(SimplePipeline, Error)
+ 				<< "No valid pipeline for sensor '"
+diff --git a/src/libcamera/pipeline/simple/walleye_pdaf.cpp b/src/libcamera/pipeline/simple/walleye_pdaf.cpp
+new file mode 100644
+index 0000000..0e5ab67
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/walleye_pdaf.cpp
+@@ -0,0 +1,403 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "walleye_pdaf.h"
++
++#include <algorithm>
++#include <chrono>
++#include <fstream>
++#include <glob.h>
++#include <string_view>
++#include <vector>
++
++#include <linux/media-bus-format.h>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/object.h>
++
++#include <libcamera/control_ids.h>
++
++#include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/dma_buf_allocator.h"
++#include "libcamera/internal/imx362_af.h"
++#include "libcamera/internal/imx362_pdaf.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++#include "libcamera/internal/media_device.h"
++#include "libcamera/internal/v4l2_subdevice.h"
++#include "libcamera/internal/v4l2_videodevice.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(WalleyePdaf)
++
++namespace {
++
++using namespace std::chrono_literals;
++
++const Size pdSize{ imx362::width, imx362::height };
++constexpr size_t frameBytes = imx362::stride * imx362::height;
++
++std::optional<imx362::Calibration> readCalibration()
++{
++	const char *directory = utils::secure_getenv("LIBCAMERA_WALLEYE_PDAF_CALIBRATION");
++	if (directory)
++		return imx362::Calibration::fromDirectory(directory);
++
++	glob_t matches{};
++	const int ret = glob("/sys/bus/nvmem/devices/walleye-camera-otp*/cells",
++			     GLOB_NOSORT, nullptr, &matches);
++	std::optional<imx362::Calibration> calibration;
++	if (!ret && matches.gl_pathc == 1)
++		calibration = imx362::Calibration::fromDirectory(matches.gl_pathv[0]);
++	globfree(&matches);
++	return calibration;
++}
++
++uint64_t nowNs()
++{
++	return std::chrono::duration_cast<std::chrono::nanoseconds>(
++		utils::clock::now().time_since_epoch()).count();
++}
++
++} /* namespace */
++
++class WalleyePdaf::Worker : public Object
++{
++public:
++	Worker(WalleyePdaf *owner, CameraLens *lens)
++		: owner_(owner), lens_(lens)
++	{
++	}
++
++	bool prepare(const MediaEntity *entity)
++	{
++		calibration_ = readCalibration();
++		if (!calibration_) {
++			LOG(WalleyePdaf, Warning) << "VC1 focus calibration is unavailable";
++			return false;
++		}
++
++		video_ = std::make_unique<V4L2VideoDevice>(entity);
++		V4L2DeviceFormat fmt{};
++		fmt.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_Y10);
++		fmt.size = pdSize;
++		if (video_->open() || video_->setFormat(&fmt) || fmt.size != pdSize ||
++		    fmt.fourcc != V4L2PixelFormat(V4L2_PIX_FMT_Y10) || fmt.planesCount != 1 ||
++		    fmt.planes[0].bpl != imx362::stride || fmt.planes[0].size < frameBytes ||
++		    video_->allocateBuffers(4, &buffers_) < 0) {
++			LOG(WalleyePdaf, Warning) << "Cannot prepare the VC1 capture device";
++			video_.reset();
++			return false;
++		}
++
++		video_->setDequeueTimeout(500ms);
++		video_->dequeueTimeout.connect(this, &Worker::timeout);
++		video_->bufferReady.connect(this, &Worker::frameReady);
++		return true;
++	}
++
++	void start(const ControlList &controls)
++	{
++		captureUsable_ = video_ && openLens();
++		controller_.reset(initialPosition_, captureUsable_);
++		apply(controls.get(controls::AfMode).value_or(controls::AfModeContinuous),
++		      controls.get(controls::AfTrigger), controls.get(controls::LensPosition));
++	}
++
++	void beginCapture()
++	{
++		if (captureUsable_ && !startCapture())
++			timeout();
++	}
++
++	void apply(std::optional<int32_t> mode, std::optional<int32_t> trigger,
++		   std::optional<float> position)
++	{
++		if (auto target = controller_.request(mode, trigger, position))
++			move(*target);
++		publish();
++	}
++
++	void stop()
++	{
++		captureUsable_ = false;
++		if (video_) {
++			video_->bufferReady.disconnect(this);
++			video_->dequeueTimeout.disconnect(this);
++			video_->streamOff();
++			video_.reset();
++		}
++		buffers_.clear();
++		if (lensOpen_)
++			lens_->close();
++	}
++
++private:
++	bool startCapture()
++	{
++		for (const auto &buffer : buffers_)
++			if (video_->queueBuffer(buffer.get()))
++				return false;
++		return video_->streamOn() == 0;
++	}
++
++	bool openLens()
++	{
++		if (lensOpen_)
++			return true;
++		if (!lens_ || lens_->open() < 0)
++			return false;
++		const auto position = lens_->focusPosition();
++		if (!position) {
++			lens_->close();
++			return false;
++		}
++		initialPosition_ = *position;
++		lensOpen_ = true;
++		return true;
++	}
++
++	void move(int position)
++	{
++		if (!openLens() || lens_->setFocusPosition(position) < 0) {
++			LOG(WalleyePdaf, Warning) << "Cannot move the rear focus actuator";
++			captureUsable_ = false;
++			controller_.unavailable();
++			return;
++		}
++		controller_.moved(position);
++		movedAt_ = nowNs();
++		previous_.clear();
++	}
++
++	void publish()
++	{
++		owner_->publish({ controller_.mode(), controller_.state(),
++				  lensOpen_ ? std::optional(controller_.dioptres()) : std::nullopt });
++	}
++
++	void timeout()
++	{
++		if (captureUsable_)
++			LOG(WalleyePdaf, Warning) << "VC1 capture failed or timed out";
++		captureUsable_ = false;
++		controller_.unavailable();
++		publish();
++	}
++
++	void frameReady(FrameBuffer *buffer)
++	{
++		const auto &meta = buffer->metadata();
++		if (meta.status == FrameMetadata::FrameCancelled)
++			return;
++
++		std::optional<imx362::PdafAf::Observation> observation;
++		const bool analyse = captureUsable_ && controller_.mode() != controls::AfModeManual &&
++				     (controller_.mode() == controls::AfModeContinuous ||
++				      controller_.state() == controls::AfStateScanning) &&
++				     meta.timestamp > movedAt_ && meta.timestamp >= nextAnalysis_;
++		if (meta.status != FrameMetadata::FrameSuccess || meta.planes().size() != 1 ||
++		    meta.planes()[0].bytesused != frameBytes) {
++			timeout();
++		} else if (analyse) {
++			/* Bound CPU use and let the buffer return before moving the lens. */
++			nextAnalysis_ = meta.timestamp + 60'000'000;
++			MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
++			if (map.isValid() && map.planes()[0].size() >= frameBytes) {
++				DmaSyncer sync(buffer->planes()[0].fd, DmaSyncer::SyncType::Read);
++				const auto bytes = map.planes()[0].first(frameBytes);
++				const auto result = imx362::analyseNative(bytes, &*calibration_, false,
++									 previous_);
++				if (result && result->usable)
++					observation = { result->candidate->phase, result->window };
++				previous_.assign(bytes.begin(), bytes.end());
++			}
++		}
++
++		if (video_->queueBuffer(buffer))
++			timeout();
++
++		if (analyse && captureUsable_) {
++			if (auto target = controller_.sample(observation))
++				move(*target);
++			publish();
++		}
++	}
++
++	WalleyePdaf *owner_;
++	CameraLens *lens_;
++	imx362::PdafAf controller_;
++	std::optional<imx362::Calibration> calibration_;
++	std::vector<uint8_t> previous_;
++	std::vector<std::unique_ptr<FrameBuffer>> buffers_;
++	std::unique_ptr<V4L2VideoDevice> video_;
++	bool captureUsable_ = false;
++	bool lensOpen_ = false;
++	int initialPosition_ = 0;
++	uint64_t movedAt_ = 0;
++	uint64_t nextAnalysis_ = 0;
++};
++
++WalleyePdaf::WalleyePdaf(MediaDevice *media, CameraLens *lens)
++	: media_(media), lens_(lens)
++{
++}
++
++WalleyePdaf::~WalleyePdaf()
++{
++	stop();
++}
++
++bool WalleyePdaf::enabled(const MediaDevice *media, const MediaEntity *sensor)
++{
++	const char *enable = utils::secure_getenv("LIBCAMERA_WALLEYE_PDAF");
++	if (!enable || std::string_view(enable) != "1" || media->driver() != "qcom-camss" ||
++	    !sensor->name().starts_with("imx362 ") || !media->getEntityByName("msm_csid0"))
++		return false;
++
++	std::ifstream compatible("/proc/device-tree/compatible", std::ios::binary);
++	for (std::string name; std::getline(compatible, name, '\0');)
++		if (name == "google,walleye")
++			return true;
++	return false;
++}
++
++void WalleyePdaf::addControls(ControlInfoMap::Map &map) const
++{
++	map.emplace(&controls::AfMode,
++		    ControlInfo(controls::AfModeValues, controls::AfModeContinuous));
++	map.emplace(&controls::AfTrigger, ControlInfo(controls::AfTriggerValues));
++	map.emplace(&controls::AfState, ControlInfo(controls::AfStateValues));
++	if (lens_)
++		map.emplace(&controls::LensPosition, ControlInfo(0.0f, imx362::PdafAf::macroDioptres, 0.0f));
++}
++
++const MediaEntity *WalleyePdaf::configureAuxiliary()
++{
++	/*
++	 * The new VC1 link to ISPIF1 is the explicit kernel contract for shared
++	 * upstream streaming. The 9037 VC1-only link to ISPIF0 is for the
++	 * diagnostic tool; using it would displace the current VC0 route.
++	 */
++	auto *csid = media_->getEntityByName("msm_csid0");
++	auto *ispif = media_->getEntityByName("msm_ispif1");
++	auto *vfe = media_->getEntityByName("msm_vfe0_rdi1");
++	auto *video = media_->getEntityByName("msm_vfe0_video1");
++	if (!csid || !ispif || !vfe || !video || video->deviceNode().empty())
++		return nullptr;
++
++	std::array<MediaLink *, 2> route{ media_->link(csid, 2, ispif, 0),
++					 media_->link(ispif, 1, vfe, 0) };
++	auto *output = media_->link(vfe, 1, video, 0);
++	if (!route[0] || !route[1] || !output || !(output->flags() & MEDIA_LNK_FL_ENABLED))
++		return nullptr;
++
++	for (const auto *entity : { ispif, vfe }) {
++		for (const auto *pad : entity->pads()) {
++			for (auto *link : pad->links())
++				if (link != output && (link->flags() & MEDIA_LNK_FL_ENABLED))
++					return nullptr;
++		}
++	}
++
++	for (unsigned int i = 0; i < route.size(); ++i) {
++		if (route[i]->setEnabled(true))
++			return nullptr;
++		enabledLinks_[i] = route[i];
++	}
++
++	for (auto [entity, pad] : { std::pair{ csid, 2U }, std::pair{ ispif, 0U },
++				    std::pair{ vfe, 0U } }) {
++		V4L2Subdevice sd(entity);
++		V4L2SubdeviceFormat format{ MEDIA_BUS_FMT_Y10_2X8_PADHI_LE, pdSize, {} };
++		if (sd.open() || sd.setFormat(pad, &format) ||
++		    format.code != MEDIA_BUS_FMT_Y10_2X8_PADHI_LE || format.size != pdSize)
++			return nullptr;
++	}
++	return video;
++}
++
++void WalleyePdaf::disableAuxiliary()
++{
++	for (auto it = enabledLinks_.rbegin(); it != enabledLinks_.rend(); ++it) {
++		if (*it && (*it)->setEnabled(false))
++			LOG(WalleyePdaf, Error) << "Failed to release a VC1 media link";
++		*it = nullptr;
++	}
++}
++
++void WalleyePdaf::prepare(bool binnedRearRoute)
++{
++	const MediaEntity *video = binnedRearRoute && lens_ ? configureAuxiliary() : nullptr;
++	worker_ = std::make_unique<Worker>(this, lens_);
++	worker_->moveToThread(&thread_);
++	thread_.start();
++
++	auxiliaryWaitingForMain_ = video &&
++		worker_->invokeMethod(&Worker::prepare, ConnectionTypeBlocking, video);
++	if (!auxiliaryWaitingForMain_) {
++		disableAuxiliary();
++		LOG(WalleyePdaf, Info) << "No independent VC1 capture for this configuration";
++	}
++}
++
++void WalleyePdaf::start(const ControlList *startControls)
++{
++	ControlList empty;
++	const ControlList &controls = startControls ? *startControls : empty;
++	const int32_t mode = controls.get(controls::AfMode).value_or(controls::AfModeContinuous);
++	publish({ mode, mode == controls::AfModeContinuous ? controls::AfStateScanning
++							 : controls::AfStateIdle,
++		  std::nullopt });
++	worker_->invokeMethod(&Worker::start, ConnectionTypeQueued, controls);
++}
++
++void WalleyePdaf::mainFrameReady()
++{
++	if (!auxiliaryWaitingForMain_)
++		return;
++
++	auxiliaryWaitingForMain_ = false;
++	worker_->invokeMethod(&Worker::beginCapture, ConnectionTypeQueued);
++}
++
++void WalleyePdaf::request(const ControlList &controls)
++{
++	const auto mode = controls.get(controls::AfMode);
++	const auto trigger = controls.get(controls::AfTrigger);
++	const auto position = controls.get(controls::LensPosition);
++	if (mode || trigger || position)
++		worker_->invokeMethod(&Worker::apply, ConnectionTypeQueued, mode, trigger, position);
++}
++
++void WalleyePdaf::publish(Snapshot snapshot)
++{
++	std::lock_guard lock(metadataMutex_);
++	snapshot_ = snapshot;
++}
++
++void WalleyePdaf::metadata(ControlList &metadata)
++{
++	Snapshot snapshot;
++	{
++		std::lock_guard lock(metadataMutex_);
++		snapshot = snapshot_;
++	}
++	metadata.set(controls::AfMode, snapshot.mode);
++	metadata.set(controls::AfState, snapshot.state);
++	if (snapshot.lensPosition)
++		metadata.set(controls::LensPosition, *snapshot.lensPosition);
++}
++
++void WalleyePdaf::stop()
++{
++	if (!worker_)
++		return;
++
++	auxiliaryWaitingForMain_ = false;
++	worker_->invokeMethod(&Worker::stop, ConnectionTypeBlocking);
++	thread_.exit();
++	thread_.wait();
++	worker_.reset();
++	disableAuxiliary();
++}
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/simple/walleye_pdaf.h b/src/libcamera/pipeline/simple/walleye_pdaf.h
+new file mode 100644
+index 0000000..be4873b
+--- /dev/null
++++ b/src/libcamera/pipeline/simple/walleye_pdaf.h
+@@ -0,0 +1,56 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include <array>
++#include <memory>
++#include <mutex>
++#include <optional>
++
++#include <libcamera/base/thread.h>
++#include <libcamera/controls.h>
++
++namespace libcamera {
++
++class CameraLens;
++class MediaDevice;
++class MediaEntity;
++class MediaLink;
++
++class WalleyePdaf
++{
++public:
++	WalleyePdaf(MediaDevice *media, CameraLens *lens);
++	~WalleyePdaf();
++
++	static bool enabled(const MediaDevice *media, const MediaEntity *sensor);
++	void addControls(ControlInfoMap::Map &controls) const;
++	void prepare(bool binnedRearRoute);
++	void start(const ControlList *controls);
++	void request(const ControlList &controls);
++	void mainFrameReady();
++	void metadata(ControlList &metadata);
++	void stop();
++
++private:
++	class Worker;
++	struct Snapshot {
++		int32_t mode;
++		int32_t state;
++		std::optional<float> lensPosition;
++	};
++
++	void publish(Snapshot snapshot);
++	const MediaEntity *configureAuxiliary();
++	void disableAuxiliary();
++
++	MediaDevice *media_;
++	CameraLens *lens_;
++	std::array<MediaLink *, 2> enabledLinks_{};
++	bool auxiliaryWaitingForMain_ = false;
++	std::mutex metadataMutex_;
++	Snapshot snapshot_{};
++	Thread thread_{ "Walleye PDAF" };
++	std::unique_ptr<Worker> worker_;
++};
++
++} /* namespace libcamera */
+diff --git a/test/imx362-pdaf-af.cpp b/test/imx362-pdaf-af.cpp
+new file mode 100644
+index 0000000..988dd72
+--- /dev/null
++++ b/test/imx362-pdaf-af.cpp
+@@ -0,0 +1,259 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "libcamera/internal/imx362_af.h"
++#include "libcamera/internal/imx362_pdaf.h"
++
++#include <array>
++#include <cmath>
++#include <cstdlib>
++#include <fstream>
++#include <iostream>
++#include <string_view>
++#include <tuple>
++#include <vector>
++
++#include <libcamera/base/event_dispatcher.h>
++#include <libcamera/base/thread.h>
++#include <libcamera/base/timer.h>
++
++using namespace imx362;
++using namespace libcamera;
++using namespace libcamera::controls;
++
++namespace {
++
++void require(bool condition, std::string_view name)
++{
++	if (condition)
++		return;
++	std::cerr << "FAIL: " << name << '\n';
++	std::exit(1);
++}
++
++/* Independent optical model for a single planar, illuminated target. */
++struct OpticalPlant {
++	int position;
++	int focalPosition;
++	double slope;
++	unsigned int moves = 0;
++	bool crossed = false;
++
++	double error() const { return slope * (position - focalPosition); }
++
++	void move(PdafAf &af, int target)
++	{
++		crossed |= (target - focalPosition) * (position - focalPosition) < 0;
++		position = target;
++		++moves;
++		af.moved(position);
++	}
++};
++
++double pattern(double x)
++{
++	return 260 + 49 * std::sin(x * 0.13) + 46 * std::cos(x * 0.31) +
++	       38 * std::sin(x * 0.43);
++}
++
++void image(std::vector<uint8_t> &frame, double phase)
++{
++	for (unsigned int y = 0; y < height; ++y) {
++		for (unsigned int x = 0; x < width / 2; ++x) {
++			const size_t off = y * stride + 4 * x;
++			for (unsigned int side = 0; side < 2; ++side) {
++				const long val = std::lround(pattern(x + y * 0.12 - side * phase));
++				frame[off + 2 * side] = val & 255;
++				frame[off + 2 * side + 1] = val >> 8;
++			}
++		}
++	}
++}
++
++unsigned int drive(PdafAf &af, OpticalPlant &plant, unsigned int frames, bool waitForLock)
++{
++	Calibration synthetic{};
++	synthetic.left.fill(1024);
++	synthetic.right.fill(1024);
++	synthetic.dcc.fill(12);
++	std::vector<uint8_t> frame(stride * height);
++
++	/* Hold exposure and focus between controller commands. */
++	image(frame, plant.error());
++	auto phase = analyseNative(frame, &synthetic, false, frame);
++	for (unsigned int i = 0; i < frames; ++i) {
++		require(phase && phase->usable && phase->window == 0, "lit centre phase");
++		require(std::abs(phase->candidate->phase - plant.error()) < 0.12,
++			"fractional optical phase");
++		if (auto target = af.sample({ { phase->candidate->phase, phase->window } })) {
++			plant.move(af, *target);
++			image(frame, plant.error());
++			phase = analyseNative(frame, &synthetic, false, frame);
++		}
++		if (waitForLock && af.state() == AfStateFocused)
++			return i + 1;
++	}
++	return frames;
++}
++
++void verifyLoop()
++{
++	PdafAf af;
++	for (const auto [start, focal, slope] : { std::tuple{ 625, 235, 0.00483 },
++						 std::tuple{ 220, 630, 0.011 } }) {
++		OpticalPlant plant{ start, focal, slope };
++		af.reset(start, true);
++		af.request(AfModeAuto, {}, {});
++		require(af.state() == AfStateIdle, "auto waits for trigger");
++		af.request({}, AfTriggerStart, {});
++		const auto frames = drive(af, plant, 96, true);
++		require(af.state() == AfStateFocused, "single shot focus");
++		require(std::abs(plant.error()) <= 0.25 && !plant.crossed, "no overshoot");
++		const auto moves = plant.moves;
++		drive(af, plant, 20, false);
++		require(plant.moves == moves, "single shot remains stationary");
++		std::cout << "Auto starts " << start << " locks at " << plant.position
++			  << " in " << frames << " frames, residual " << plant.error()
++			  << " samples, moves " << moves << ", zero overshoot\n";
++	}
++
++	OpticalPlant plant{ 425, 675, 0.006 };
++	af.reset(plant.position, true);
++	af.request(AfModeContinuous, {}, {});
++	const auto first = drive(af, plant, 96, true);
++	require(af.state() == AfStateFocused, "continuous initial lock");
++	unsigned int moves = plant.moves;
++	for (int i = 0; i < 70; ++i)
++		require(!af.sample({ { (i % 2 ? 1 : -1) * 0.54, 0 } }), "relock hysteresis");
++	plant.focalPosition = 390;
++	drive(af, plant, 3, false);
++	require(af.state() == AfStateScanning, "continuous scene-change detection");
++	const auto second = drive(af, plant, 96, true);
++	require(af.state() == AfStateFocused && std::abs(plant.error()) <= 0.25 &&
++		!plant.crossed, "continuous scene-change lock");
++	require(plant.moves > moves, "relock uses actuator");
++	moves = plant.moves;
++	drive(af, plant, 20, false);
++	require(plant.moves == moves, "continuous does not hunt");
++	std::cout << "Continuous locks in " << first << " frames and relocks in "
++		  << second + 3 << " frames, residual " << plant.error()
++		  << " samples, zero moves in 70 hysteresis and 20 stationary frames\n";
++
++	auto manual = af.request(AfModeManual, AfTriggerStart, 5.0f);
++	require(manual == 512 && af.state() == AfStateIdle, "manual dioptres");
++	plant.move(af, *manual);
++	require(!af.sample({ { 2.0, 0 } }) && af.position() == 512, "manual holds position");
++	af.request(AfModeAuto, AfTriggerStart, {});
++	require(af.state() == AfStateScanning, "start auto after manual");
++	af.request({}, AfTriggerCancel, {});
++	require(af.state() == AfStateIdle, "cancel auto");
++	std::cout << "Manual: 5.0 dioptres maps to actuator position 512\n";
++}
++
++void verifyLowLight()
++{
++	Calibration synthetic{};
++	synthetic.left.fill(1024);
++	synthetic.right.fill(1024);
++	synthetic.dcc.fill(12);
++
++	for (uint8_t illumination : { 64, 150 }) {
++		std::vector<uint8_t> flat(stride * height);
++		for (unsigned int i = 0; i < flat.size(); i += 2)
++			flat[i] = illumination;
++		const auto observation = analyseNative(flat, &synthetic, false, flat);
++		require(observation && !observation->usable, "dark or low contrast rejected");
++		PdafAf af;
++		af.reset(640, true);
++		af.request(AfModeAuto, AfTriggerStart, {});
++		for (unsigned int frame = 0; frame < 8; ++frame)
++			require(!af.sample({}), "unusable observation must not move lens");
++		require(af.state() == AfStateFailed && af.position() == 640, "safe dark failure");
++	}
++	std::cout << "Dark and lit flat images: failed after eight samples, held position 640\n";
++}
++
++void verifyIndependentEvents()
++{
++	/* Real libcamera event dispatcher, independent preview and VC1 timers.
++	 * The optical plant and timer cadence here are simulation inputs. */
++	using namespace std::chrono_literals;
++	PdafAf af;
++	af.reset(320, true);
++	af.request(AfModeContinuous, {}, {});
++	unsigned int previewFrames = 0;
++	unsigned int errorAt = 0;
++	unsigned int timeoutAt = 0;
++	Timer preview, error, timeout;
++	preview.timeout.connect(&preview, [&] {
++		++previewFrames;
++		if (previewFrames < 120)
++			preview.start(1ms);
++	});
++	error.timeout.connect(&error, [&] {
++		errorAt = previewFrames;
++		af.unavailable();
++		require(af.state() == AfStateFailed, "VC1 transport error");
++		af.reset(320, true);
++		af.request(AfModeContinuous, {}, {});
++	});
++	timeout.timeout.connect(&timeout, [&] {
++		timeoutAt = previewFrames;
++		af.unavailable();
++		require(af.state() == AfStateFailed, "VC1 dequeue timeout");
++	});
++	error.start(20ms);
++	timeout.start(55ms);
++	preview.start(1ms);
++	while (previewFrames < 120)
++		Thread::current()->eventDispatcher()->processEvents();
++	require(errorAt > 0 && timeoutAt > errorAt && previewFrames > timeoutAt,
++		"preview completes independently of VC1");
++	require(af.position() == 320, "transport failure holds lens");
++	std::cout << "Independent dispatcher: 120/120 preview events, VC1 error at "
++		  << errorAt << ", VC1 timeout at " << timeoutAt << '\n';
++}
++
++void verifyReplay(char **paths)
++{
++	constexpr std::array<double, 3> phases{ 0.332, 1.786, 2.404 };
++	for (unsigned int i = 0; i < phases.size(); ++i) {
++		std::ifstream in(paths[i], std::ios::binary);
++		std::vector<uint8_t> frame(stride * height);
++		require(bool(in.read(reinterpret_cast<char *>(frame.data()), frame.size())) &&
++			in.peek() == EOF, "read exact real r59 VC1 frame");
++		const auto centreOnly = analyse(frame);
++		const auto multiWindow = analyseNative(frame, nullptr, true);
++		require(centreOnly && !centreOnly->textured(), "r8 centre lacks contrast");
++		require(multiWindow && multiWindow->candidate && multiWindow->window != 0 &&
++			!multiWindow->usable && multiWindow->mean < dimMean, "dark edge replay");
++		PdafAf af;
++		af.reset(448, true);
++		af.request(AfModeAuto, AfTriggerStart, {});
++		for (int frameNumber = 0; frameNumber < 8; ++frameNumber) {
++			std::optional<PdafAf::Observation> observation;
++			if (multiWindow->usable)
++				observation = { multiWindow->candidate->phase, multiWindow->window };
++			require(!af.sample(observation), "dark r59 frame cannot move actuator");
++		}
++		require(af.state() == AfStateFailed && af.position() == 448,
++			"closed-loop r59 dark fallback");
++		const auto phase = multiWindow->candidate->phase;
++		require(std::abs(phase - phases[i]) < 0.16, "r59 optical phase");
++		std::cout << "Replay " << paths[i] << " centre rms " << centreOnly->rmsLeft
++			  << '/' << centreOnly->rmsRight << ", window " << multiWindow->window
++			  << ", phase " << phase << ", correlation "
++			  << multiWindow->candidate->correlation << ", motion prohibited\n";
++	}
++}
++
++} /* namespace */
++
++int main(int argc, char **argv)
++{
++	if (argc == 4)
++		verifyReplay(argv + 1);
++	else
++		require(argc == 1, "usage: imx362-pdaf-af-test [INITIAL RAW448 RAW576]");
++	verifyLoop();
++	verifyLowLight();
++	verifyIndependentEvents();
++}
+diff --git a/test/imx362-pdaf.cpp b/test/imx362-pdaf.cpp
+index 6ee4452..81e4662 100644
+--- a/test/imx362-pdaf.cpp
++++ b/test/imx362-pdaf.cpp
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: LGPL-2.1-or-later
+-#include "../src/apps/imx362-pdaf/pdaf.h"
++#include "libcamera/internal/imx362_pdaf.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+diff --git a/test/meson.build b/test/meson.build
+index a600946..ff030d7 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -133,7 +133,10 @@ endforeach
+ 
+ if 'simple' in pipelines
+     imx362_pdaf_test = executable('imx362-pdaf-test',
+-        ['imx362-pdaf.cpp', '../src/apps/imx362-pdaf/pdaf.cpp'],
++        ['imx362-pdaf.cpp'],
+         dependencies : libcamera_private)
+     test('imx362-pdaf', imx362_pdaf_test)
++    imx362_pdaf_af_test = executable('imx362-pdaf-af-test',
++        'imx362-pdaf-af.cpp', dependencies : libcamera_private)
++    test('imx362-pdaf-af', imx362_pdaf_af_test)
+ endif

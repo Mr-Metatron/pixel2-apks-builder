@@ -1,0 +1,21 @@
+Subject: [PATCH] libcamera: sensor: Add the Sony IMX179 unit cell size
+
+The Sony IMX179 product brief specifies square 1.4 µm cells. The Pixel 2
+front camera uses this sensor. The unit cell size property is expressed in
+nanometres. Leave control delays unset until their effects on output frames
+are measured.
+
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -183,6 +183,11 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sens
+ 				.hblankDelay = 2
+ 			},
+ 		} },
++		{ "imx179", {
++			.unitCellSize = { 1400, 1400 },
++			.testPatternModes = { },
++			.sensorDelays = { },
++		} },
+ 		{ "imx214", {
+ 			.unitCellSize = { 1120, 1120 },
+ 			.testPatternModes = {

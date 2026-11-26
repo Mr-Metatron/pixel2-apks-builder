@@ -1,0 +1,209 @@
+Subject: [PATCH] debayer: map the IMX362 Bayer neighborhood without integer division
+
+An aligned linear view changes only the texture interpretation of the
+sensor byte stream. Compute the middle address once, derive both other
+rows by adding or subtracting the sensor pitch, then wrap horizontal
+taps in the physical view after clamping in logical camera coordinates.
+Make the upload program the default until live Adreno A/B validation.
+
+Downstream for libcamera v0.7.1 and patch 0015. Remove with 0015 when the
+upstream input layout can match the camera pitch at full preview rate.
+
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 772f92d..eca13a4 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -71,25 +71,41 @@ uniform float gamma;
+ uniform float contrastExp;
+ 
+ #ifdef INPUT_REMAP
+-/* x: logical pitch (zero for upload), yz: dimensions of the imported R8 view. */
+-uniform highp ivec3 input_remap;
++/* The only remapped input is walleye's 2520x1512 RAW10 byte stream.
++ * It is exposed as a linear 3136x1215 R8 texture. All byte offsets
++ * are below 2^22 and exactly representable in highp float. */
++uniform bool input_remap;
+ 
+-float sampleByte(vec2 pos)
++vec2 remapCenter(vec2 logical)
+ {
+-	if (input_remap.x == 0)
+-		return texture2D(tex_y, pos).r;
++	float k = logical.y * 2520.0 + logical.x;
++	float v = floor(k * (1.0 / 3136.0));
++	float u = k - v * 3136.0;
++	/* A rounded-down reciprocal can undershoot at a row boundary. */
++	if (u >= 3136.0) {
++		u -= 3136.0;
++		v += 1.0;
++	}
++	return vec2(u, v);
++}
+ 
+-	/* Clamp each tap in the camera layout before crossing texture rows. */
+-	highp ivec2 logical = ivec2(clamp(pos, vec2(0.0),
+-					  vec2(float(input_remap.x) - 1.0, tex_size.y - 1.0)));
+-	highp int k = logical.y * input_remap.x + logical.x;
+-	highp int v = k / input_remap.y;
+-	highp int u = k - v * input_remap.y;
+-	return texture2D(tex_y, (vec2(u, v) + 0.5) / vec2(input_remap.yz)).r;
++/* The row stride and every horizontal offset are smaller than 3136. */
++vec2 shiftLeft(vec2 address, float offset)
++{
++	float u = address.x + offset;
++	return u < 0.0 ? vec2(u + 3136.0, address.y - 1.0) : vec2(u, address.y);
++}
++
++vec2 shiftRight(vec2 address, float offset)
++{
++	float u = address.x + offset;
++	return u >= 3136.0 ? vec2(u - 3136.0, address.y + 1.0) : vec2(u, address.y);
++}
++
++float fetchRemapped(vec2 address)
++{
++	return texture2D(tex_y, (address + 0.5) * vec2(1.0 / 3136.0, 1.0 / 1215.0)).r;
+ }
+-#define fetch(x, y) sampleByte(vec2(x, y))
+-#else
+-#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
+ #endif
+ 
+ float apply_contrast(float value)
+@@ -146,29 +162,6 @@ void main(void)
+ 	 * of the group of the pixels.
+ 	 */
+ 	center_bytes.x = floor(center_bytes.x);
+-	vec2 stepSize = tex_step;
+-#ifdef INPUT_REMAP
+-	if (input_remap.x != 0)
+-		stepSize = vec2(1.0);
+-#endif
+-	center_bytes *= stepSize;
+-
+-	xcoords = center_bytes.x + vec2(-stepSize.x, stepSize.x);
+-	ycoords = center_bytes.y + vec2(-stepSize.y, stepSize.y);
+-
+-	/*
+-	 * If xcoords[0] points at the byte containing the LS bits
+-	 * of the previous group of the pixels, move xcoords[0] one
+-	 * byte back.
+-	 */
+-	xcoords[0] += (fract_x < THRESHOLD_L) ? -stepSize.x : 0.0;
+-
+-	/*
+-	 * If xcoords[1] points at the byte containing the LS bits
+-	 * of the current group of the pixels, move xcoords[1] one
+-	 * byte forward.
+-	 */
+-	xcoords[1] += (fract_x > THRESHOLD_H) ? stepSize.x : 0.0;
+ 
+ 	vec2 alternate = mod(center_pixel.xy + tex_bayer_first_red, 2.0);
+ 	bool even_col = alternate.x < 1.0;
+@@ -225,17 +218,46 @@ void main(void)
+ 	 *   patterns.z = (A0 + A1 + B0 + B1) / 4.0
+ 	 *   patterns.w = (D0 + D1 + D2 + D3) / 4.0
+ 	 */
+-	float C = fetch(center_bytes.x, center_bytes.y);
+-	vec4 patterns = vec4(
+-		fetch(center_bytes.x, ycoords[0]),	/* A0: (0,-1) */
+-		fetch(xcoords[0], center_bytes.y),	/* B0: (-1,0) */
+-		fetch(xcoords[0], ycoords[0]),		/* D0: (-1,-1) */
+-		fetch(xcoords[1], ycoords[0]));		/* D1: (1,-1) */
+-	vec4 temp = vec4(
+-		fetch(center_bytes.x, ycoords[1]),	/* A1: (0,1) */
+-		fetch(xcoords[1], center_bytes.y),	/* B1: (1,0) */
+-		fetch(xcoords[1], ycoords[1]),		/* D3: (1,1) */
+-		fetch(xcoords[0], ycoords[1]));		/* D2: (-1,1) */
++	float C;
++	vec4 patterns, temp;
++#ifdef INPUT_REMAP
++	if (input_remap) {
++		/* Clamp in camera coordinates before shifting in the import view. */
++		float left = max((fract_x < THRESHOLD_L) ? -2.0 : -1.0, -center_bytes.x);
++		float right = min((fract_x > THRESHOLD_H) ? 2.0 : 1.0, 2519.0 - center_bytes.x);
++		vec2 middle = remapCenter(center_bytes);
++		vec2 above = shiftLeft(middle, center_bytes.y > 0.0 ? -2520.0 : 0.0);
++		vec2 below = shiftRight(middle, center_bytes.y < 1511.0 ? 2520.0 : 0.0);
++		C = fetchRemapped(middle);
++		patterns = vec4(fetchRemapped(above),
++				fetchRemapped(shiftLeft(middle, left)),
++				fetchRemapped(shiftLeft(above, left)),
++				fetchRemapped(shiftRight(above, right)));
++		temp = vec4(fetchRemapped(below),
++			    fetchRemapped(shiftRight(middle, right)),
++			    fetchRemapped(shiftRight(below, right)),
++			    fetchRemapped(shiftLeft(below, left)));
++	} else
++#endif
++	{
++		center_bytes *= tex_step;
++		xcoords = center_bytes.x + vec2(-tex_step.x, tex_step.x);
++		ycoords = center_bytes.y + vec2(-tex_step.y, tex_step.y);
++		xcoords[0] += (fract_x < THRESHOLD_L) ? -tex_step.x : 0.0;
++		xcoords[1] += (fract_x > THRESHOLD_H) ? tex_step.x : 0.0;
++
++		#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
++		C = fetch(center_bytes.x, center_bytes.y);
++		patterns = vec4(fetch(center_bytes.x, ycoords[0]),
++				fetch(xcoords[0], center_bytes.y),
++				fetch(xcoords[0], ycoords[0]),
++				fetch(xcoords[1], ycoords[0]));
++		temp = vec4(fetch(center_bytes.x, ycoords[1]),
++			    fetch(xcoords[1], center_bytes.y),
++			    fetch(xcoords[1], ycoords[1]),
++			    fetch(xcoords[0], ycoords[1]));
++	}
++
+ 	patterns = (patterns + temp) * 0.5;
+ 		/* .x = (A0 + A1) / 2.0, .y = (B0 + B1) / 2.0 */
+ 		/* .z = (D0 + D3) / 2.0, .w = (D1 + D2) / 2.0 */
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index c8a2b84..abeb9ec 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -218,16 +218,26 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	case libcamera::formats::SGRBG10_CSI2P:
+ 	case libcamera::formats::SRGGB10_CSI2P:
+ 		egl_.pushEnv(shaderEnv, "#define RAW10P");
+-		if (inputConfig_.stride % 64 && inputConfig_.stride == 2520 &&
+-		    width_ == 2016 && height_ == 1512) {
+-			const char *disable = utils::secure_getenv("LIBCAMERA_WALLEYE_DISABLE_INPUT_REMAP");
+-			forceUpload_ = disable && std::string_view(disable) == "1";
+-			GLint maxSize, range[2], floatBits, intBits;
+-			glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
+-			glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &floatBits);
+-			glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_INT, range, &intBits);
+-			if (maxSize >= static_cast<GLint>(imx362View.width) && floatBits >= 23 && range[1] >= 22)
++		if (inputConfig_.stride == 2520 && width_ == 2016 && height_ == 1512) {
++			const char *setting = utils::secure_getenv("LIBCAMERA_WALLEYE_INPUT_REMAP");
++			const std::string_view mode = setting ? setting : "auto";
++			if (mode != "auto" && mode != "off" && mode != "on") {
++				LOG(Debayer, Error) << "LIBCAMERA_WALLEYE_INPUT_REMAP must be auto, on, or off";
++				return -EINVAL;
++			}
++
++			/* Keep the r9 upload path as the default until the fd5 A/B passes. */
++			forceUpload_ = mode != "on";
++			if (!forceUpload_) {
++				GLint maxSize, range[2], floatBits;
++				glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
++				glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &floatBits);
++				if (maxSize < static_cast<GLint>(imx362View.width) || floatBits < 23) {
++					LOG(Debayer, Error) << "Input remap requires a 3136-wide texture and highp float";
++					return -EINVAL;
++				}
+ 				egl_.pushEnv(shaderEnv, "#define INPUT_REMAP");
++			}
+ 		}
+ 		if (BayerFormat::fromPixelFormat(inputFormat).packing == BayerFormat::Packing::None) {
+ 			fragmentShaderData = bayer_unpacked_frag;
+@@ -550,7 +560,7 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, int out_fd, const DebayerParams &
+ 
+ 	/* A failed import, including one following a successful frame, uses the original sampling. */
+ 	const bool remapped = imported && tryRemap;
+-	glUniform3i(inputRemapUniform_, remapped ? logicalPitch : 0, view.width, view.height);
++	glUniform1i(inputRemapUniform_, remapped);
+ 	if (egl_.traceInput()) {
+ 		inputImports_ += imported;
+ 		inputUploads_ += !imported;

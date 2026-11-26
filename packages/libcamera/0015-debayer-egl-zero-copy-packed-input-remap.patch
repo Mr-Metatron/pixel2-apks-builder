@@ -1,0 +1,378 @@
+Subject: [PATCH] debayer: import the IMX362 packed input through an aligned R8 view
+
+The walleye VFE writes 2520 bytes per line. fd5 linear R8 needs a
+64-byte pitch. Use a 3136x1215 view only for the matching packed RAW10
+configuration and buffers large enough for 1216 physical rows. Translate
+each logical byte in the fragment shader. Preserve the original upload
+layout per frame and keep CPU statistics on the camera stride.
+
+Downstream candidate for libcamera v0.7.1 with postmarketOS patch 0003.
+Remove when upstream handles this fd5 input layout and same-frame output
+and import counters have been verified on walleye.
+
+diff --git a/include/libcamera/internal/egl.h b/include/libcamera/internal/egl.h
+index bb97b0c..b84b2e0 100644
+--- a/include/libcamera/internal/egl.h
++++ b/include/libcamera/internal/egl.h
+@@ -100,8 +100,9 @@ public:
+ 	~eGL();
+ 
+ 	int initEGLContext();
++	bool traceInput() const { return traceInput_; }
+ 
+-	int createInputDMABufTexture2D(eGLImage &eglImage, int fd, GLint format, uint32_t width, uint32_t height);
++	int createInputDMABufTexture2D(eGLImage &eglImage, int fd, GLint format, uint32_t width, uint32_t height, uint32_t pitch);
+ 	int createOutputDMABufTexture2D(eGLImage &eglImage, int fd);
+ 	void createTexture2D(eGLImage &eglImage, GLint format, uint32_t width, uint32_t height, void *data);
+ 
+@@ -124,6 +125,7 @@ private:
+ 	LIBCAMERA_DISABLE_COPY_AND_MOVE(eGL)
+ 
+ 	pid_t tid_;
++	bool traceInput_ = false;
+ 
+ 	EGLDisplay display_ = EGL_NO_DISPLAY;
+ 	EGLContext context_ = EGL_NO_CONTEXT;
+@@ -133,7 +135,7 @@ private:
+ 			  unsigned int shaderDataLen,
+ 			  Span<const std::string> shaderEnv);
+ 
+-	int createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format, uint32_t width, uint32_t height, bool output);
++	int createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format, uint32_t width, uint32_t height, uint32_t pitch, bool output);
+ 
+ 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+ 	PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
+diff --git a/src/libcamera/egl.cpp b/src/libcamera/egl.cpp
+index febfd4b..b2f6013 100644
+--- a/src/libcamera/egl.cpp
++++ b/src/libcamera/egl.cpp
+@@ -10,6 +10,7 @@
+ #include "libcamera/internal/egl.h"
+ 
+ #include <fcntl.h>
++#include <string_view>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -106,6 +107,7 @@ void eGL::syncOutput()
+  * \param[in] drm_format the DRM fourcc
+  * \param[in] width the buffer width
+  * \param[in] height the buffer height
++ * \param[in] pitch byte distance between texture rows
+  * \param[in] output If true, create framebuffer for render target
+  *
+  * Internal implementation for creating DMA-BUF textures. Creates an EGL
+@@ -114,7 +116,7 @@ void eGL::syncOutput()
+  *
+  * \return 0 on success, or -ENODEV on failure
+  */
+-int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format, uint32_t width, uint32_t height, bool output)
++int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format, uint32_t width, uint32_t height, uint32_t pitch, bool output)
+ {
+ 	ASSERT(tid_ == Thread::currentId());
+ 
+@@ -125,7 +127,7 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format,
+ 		EGL_LINUX_DRM_FOURCC_EXT, (EGLint)drm_format,
+ 		EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+ 		EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+-		EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)eglImage.stride_,
++		EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)pitch,
+ 		EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,
+ 		EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
+ 		EGL_NONE,
+@@ -137,7 +139,12 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format,
+ 					      NULL, image_attrs);
+ 
+ 	if (image == EGL_NO_IMAGE_KHR) {
+-		LOG(eGL, Debug) << "eglCreateImageKHR fail";
++		if (traceInput_) {
++			EGLint error = eglGetError();
++			LOG(eGL, Info) << "EGL image failure output=" << output
++				       << " fd=" << fd << " size=" << width << "x" << height
++				       << " pitch=" << pitch << " eglError=" << utils::hex(error);
++		}
+ 		return -ENODEV;
+ 	}
+ 
+@@ -147,7 +154,12 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format,
+ 
+ 	// Generate texture with filter semantics
+ 	glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
++	GLenum bindError = glGetError();
+ 	eglDestroyImageKHR(display_, image);
++	if (bindError != GL_NO_ERROR) {
++		LOG(eGL, Error) << "EGL image texture bind failed " << utils::hex(bindError);
++		return -ENODEV;
++	}
+ 
+ 	// Nearest filtering
+ 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+@@ -179,6 +191,7 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format,
+  * \param[in] format the GL format
+  * \param[in] width the buffer width
+  * \param[in] height the buffer height
++ * \param[in] pitch byte distance between texture rows
+  *
+  * Creates an EGL image from a DMA-BUF file descriptor and binds it to
+  * a 2D texture for use as an input texture in shaders. The texture is
+@@ -186,7 +199,7 @@ int eGL::createDMABufTexture2D(eGLImage &eglImage, int fd, uint32_t drm_format,
+  *
+  * \return 0 on success, or -ENODEV on failure
+  */
+-int eGL::createInputDMABufTexture2D(eGLImage &eglImage, int fd, GLint format, uint32_t width, uint32_t height)
++int eGL::createInputDMABufTexture2D(eGLImage &eglImage, int fd, GLint format, uint32_t width, uint32_t height, uint32_t pitch)
+ {
+ 	EGLint drm_format;
+ 
+@@ -204,7 +217,7 @@ int eGL::createInputDMABufTexture2D(eGLImage &eglImage, int fd, GLint format, ui
+ 		return -ENODEV;
+ 	}
+ 
+-	return createDMABufTexture2D(eglImage, fd, drm_format, width, height, false);
++	return createDMABufTexture2D(eglImage, fd, drm_format, width, height, pitch, false);
+ }
+ 
+ /**
+@@ -223,7 +236,7 @@ int eGL::createOutputDMABufTexture2D(eGLImage &eglImage, int fd)
+ {
+ 	ASSERT(tid_ == Thread::currentId());
+ 
+-	return createDMABufTexture2D(eglImage, fd, DRM_FORMAT_ARGB8888, eglImage.width_, eglImage.height_, true);
++	return createDMABufTexture2D(eglImage, fd, DRM_FORMAT_ARGB8888, eglImage.width_, eglImage.height_, eglImage.stride_, true);
+ }
+ 
+ /**
+@@ -285,6 +298,7 @@ int eGL::initEGLContext()
+ 		EGL_NONE
+ 	};
+ 
++	const char *trace = utils::secure_getenv("LIBCAMERA_WALLEYE_EGL_TRACE");
+ 	EGLint numConfigs;
+ 	EGLConfig config;
+ 
+@@ -350,6 +364,10 @@ int eGL::initEGLContext()
+ 
+ 	makeCurrent();
+ 
++	traceInput_ = trace && std::string_view(trace) == "1";
++	if (traceInput_)
++		LOG(eGL, Info) << "GL_RENDERER=" << glGetString(GL_RENDERER);
++
+ 	LOG(eGL, Info) << "EGL: GL_VERSION: " << glGetString(GL_VERSION);
+ 
+ 	return 0;
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 23747f7..772f92d 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -70,6 +70,28 @@ uniform vec3 blacklevel;
+ uniform float gamma;
+ uniform float contrastExp;
+ 
++#ifdef INPUT_REMAP
++/* x: logical pitch (zero for upload), yz: dimensions of the imported R8 view. */
++uniform highp ivec3 input_remap;
++
++float sampleByte(vec2 pos)
++{
++	if (input_remap.x == 0)
++		return texture2D(tex_y, pos).r;
++
++	/* Clamp each tap in the camera layout before crossing texture rows. */
++	highp ivec2 logical = ivec2(clamp(pos, vec2(0.0),
++					  vec2(float(input_remap.x) - 1.0, tex_size.y - 1.0)));
++	highp int k = logical.y * input_remap.x + logical.x;
++	highp int v = k / input_remap.y;
++	highp int u = k - v * input_remap.y;
++	return texture2D(tex_y, (vec2(u, v) + 0.5) / vec2(input_remap.yz)).r;
++}
++#define fetch(x, y) sampleByte(vec2(x, y))
++#else
++#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
++#endif
++
+ float apply_contrast(float value)
+ {
+ 	// Apply simple S-curve
+@@ -124,24 +146,29 @@ void main(void)
+ 	 * of the group of the pixels.
+ 	 */
+ 	center_bytes.x = floor(center_bytes.x);
+-	center_bytes *= tex_step;
++	vec2 stepSize = tex_step;
++#ifdef INPUT_REMAP
++	if (input_remap.x != 0)
++		stepSize = vec2(1.0);
++#endif
++	center_bytes *= stepSize;
+ 
+-	xcoords = center_bytes.x + vec2(-tex_step.x, tex_step.x);
+-	ycoords = center_bytes.y + vec2(-tex_step.y, tex_step.y);
++	xcoords = center_bytes.x + vec2(-stepSize.x, stepSize.x);
++	ycoords = center_bytes.y + vec2(-stepSize.y, stepSize.y);
+ 
+ 	/*
+ 	 * If xcoords[0] points at the byte containing the LS bits
+ 	 * of the previous group of the pixels, move xcoords[0] one
+ 	 * byte back.
+ 	 */
+-	xcoords[0] += (fract_x < THRESHOLD_L) ? -tex_step.x : 0.0;
++	xcoords[0] += (fract_x < THRESHOLD_L) ? -stepSize.x : 0.0;
+ 
+ 	/*
+ 	 * If xcoords[1] points at the byte containing the LS bits
+ 	 * of the current group of the pixels, move xcoords[1] one
+ 	 * byte forward.
+ 	 */
+-	xcoords[1] += (fract_x > THRESHOLD_H) ? tex_step.x : 0.0;
++	xcoords[1] += (fract_x > THRESHOLD_H) ? stepSize.x : 0.0;
+ 
+ 	vec2 alternate = mod(center_pixel.xy + tex_bayer_first_red, 2.0);
+ 	bool even_col = alternate.x < 1.0;
+@@ -198,9 +225,7 @@ void main(void)
+ 	 *   patterns.z = (A0 + A1 + B0 + B1) / 4.0
+ 	 *   patterns.w = (D0 + D1 + D2 + D3) / 4.0
+ 	 */
+-	#define fetch(x, y) texture2D(tex_y, vec2(x, y)).r
+-
+-	float C = texture2D(tex_y, center_bytes).r;
++	float C = fetch(center_bytes.x, center_bytes.y);
+ 	vec4 patterns = vec4(
+ 		fetch(center_bytes.x, ycoords[0]),	/* A0: (0,-1) */
+ 		fetch(xcoords[0], center_bytes.y),	/* B0: (-1,0) */
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 30b6c10..c8a2b84 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <cmath>
+ #include <stdlib.h>
++#include <string_view>
++#include <sys/stat.h>
+ #include <time.h>
+ 
+ #include <libcamera/base/utils.h>
+@@ -21,6 +23,12 @@
+ 
+ namespace libcamera {
+ 
++/* The VFE writes contiguous bytes. Only the Adreno R8 texture view changes. */
++static constexpr Size imx362View{ 3136, 1215 };
++static constexpr unsigned int imx362Bytes = imx362View.width * imx362View.height;
++static_assert(2520 * 1512 == imx362Bytes && imx362View.width % 64 == 0);
++static constexpr unsigned int imx362Storage = imx362View.width * utils::alignUp(imx362View.height, 32);
++
+ /**
+  * \class DebayerEGL
+  * \brief Class for debayering using an EGL Shader
+@@ -104,6 +112,7 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
+ 
++	inputRemapUniform_ = glGetUniformLocation(programId_, "input_remap");
+ 	textureUniformStep_ = glGetUniformLocation(programId_, "tex_step");
+ 	textureUniformSize_ = glGetUniformLocation(programId_, "tex_size");
+ 	textureUniformStrideFactor_ = glGetUniformLocation(programId_, "stride_factor");
+@@ -191,6 +200,8 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 		return -EINVAL;
+ 	};
+ 
++	forceUpload_ = false;
++
+ 	/* Shader selection */
+ 	switch (inputFormat) {
+ 	case libcamera::formats::SBGGR8:
+@@ -207,6 +218,17 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 	case libcamera::formats::SGRBG10_CSI2P:
+ 	case libcamera::formats::SRGGB10_CSI2P:
+ 		egl_.pushEnv(shaderEnv, "#define RAW10P");
++		if (inputConfig_.stride % 64 && inputConfig_.stride == 2520 &&
++		    width_ == 2016 && height_ == 1512) {
++			const char *disable = utils::secure_getenv("LIBCAMERA_WALLEYE_DISABLE_INPUT_REMAP");
++			forceUpload_ = disable && std::string_view(disable) == "1";
++			GLint maxSize, range[2], floatBits, intBits;
++			glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxSize);
++			glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &floatBits);
++			glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_INT, range, &intBits);
++			if (maxSize >= static_cast<GLint>(imx362View.width) && floatBits >= 23 && range[1] >= 22)
++				egl_.pushEnv(shaderEnv, "#define INPUT_REMAP");
++		}
+ 		if (BayerFormat::fromPixelFormat(inputFormat).packing == BayerFormat::Packing::None) {
+ 			fragmentShaderData = bayer_unpacked_frag;
+ 			fragmentShaderDataLen = bayer_unpacked_frag_len;
+@@ -502,20 +524,44 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, int out_fd, const DebayerParams &
+ 	/* eGL context switch */
+ 	egl_.makeCurrent();
+ 
+-	/* Create a standard texture input */
+-	if (egl_.createInputDMABufTexture2D(*eglImageBayerIn_, input->planes()[0].fd.get(), glFormat_, inputConfig_.stride / bytesPerPixel_, height_) != 0) {
++	const auto &plane = input->planes()[0];
++	const unsigned int logicalPitch = inputConfig_.stride;
++	struct stat st {};
++	const bool statOK = (inputRemapUniform_ >= 0 || egl_.traceInput()) &&
++			    fstat(plane.fd.get(), &st) == 0;
++	const bool tryRemap = inputRemapUniform_ >= 0 && !forceUpload_ &&
++			      input->planes().size() == 1 && plane.offset == 0 &&
++			      plane.length >= imx362Bytes && statOK && st.st_size >= imx362Storage;
++	const Size logical{ logicalPitch / bytesPerPixel_, height_ };
++	const Size view = tryRemap ? imx362View : logical;
++	const unsigned int pitch = tryRemap ? view.width : logicalPitch;
++	const bool imported = !forceUpload_ && plane.offset == 0 &&
++		egl_.createInputDMABufTexture2D(*eglImageBayerIn_, plane.fd.get(), glFormat_,
++						view.width, view.height, pitch) == 0;
++	if (!imported) {
+ 		MappedFrameBuffer in(input, MappedFrameBuffer::MapFlag::Read);
+ 		if (!in.isValid()) {
+ 			LOG(Debayer, Error) << "mmap-ing buffer(s) failed";
+ 			return -ENODEV;
+ 		}
+ 
+-		LOG(Debayer, Debug) << "Importing input buffer with DMABuf import failed, falling back to upload";
+-		egl_.createTexture2D(*eglImageBayerIn_, glFormat_, inputConfig_.stride / bytesPerPixel_, height_, in.planes()[0].data());
++		egl_.createTexture2D(*eglImageBayerIn_, glFormat_, logical.width, logical.height, in.planes()[0].data());
+ 	}
+ 
+-	/* Generate the output render framebuffer as render to texture */
+-	egl_.createOutputDMABufTexture2D(*eglImageBayerOut_, out_fd);
++	/* A failed import, including one following a successful frame, uses the original sampling. */
++	const bool remapped = imported && tryRemap;
++	glUniform3i(inputRemapUniform_, remapped ? logicalPitch : 0, view.width, view.height);
++	if (egl_.traceInput()) {
++		inputImports_ += imported;
++		inputUploads_ += !imported;
++		LOG(Debayer, Info) << "EGL input fd=" << plane.fd.get() << " fdSize=" << (statOK ? st.st_size : -1)
++				   << " planeLength=" << plane.length << " offset=" << plane.offset
++				   << " view=" << view << " pitch=" << pitch << " remapped=" << remapped
++				   << " imports=" << inputImports_ << " uploads=" << inputUploads_;
++	}
++
++	if (egl_.createOutputDMABufTexture2D(*eglImageBayerOut_, out_fd))
++		return -ENODEV;
+ 
+ 	setShaderVariableValues(params);
+ 	glViewport(0, 0, width_, height_);
+@@ -574,6 +620,8 @@ error:
+ int DebayerEGL::start()
+ {
+ 	GLint maxTextureImageUnits;
++	inputImports_ = 0;
++	inputUploads_ = 0;
+ 
+ 	if (egl_.initEGLContext())
+ 		return -ENODEV;
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 5a1e4df..e2509c7 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -83,6 +83,10 @@ private:
+ 	GLint attributeVertex_;
+ 	GLint attributeTexture_;
+ 	GLint textureUniformStep_;
++	GLint inputRemapUniform_;
++	bool forceUpload_ = false;
++	unsigned int inputImports_ = 0;
++	unsigned int inputUploads_ = 0;
+ 	GLint textureUniformSize_;
+ 	GLint textureUniformStrideFactor_;
+ 	GLint textureUniformBayerFirstRed_;

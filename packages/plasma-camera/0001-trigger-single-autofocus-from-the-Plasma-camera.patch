@@ -1,0 +1,361 @@
+From: Pixel 2 Linux project
+Subject: [PATCH] Trigger a single libcamera autofocus scan from the viewfinder
+
+Offer autofocus on cameras reporting the standard one-shot controls. Set
+the trigger only on the next request and wait for that scan's metadata.
+
+diff --git a/po/zh_CN/plasma-camera.po b/po/zh_CN/plasma-camera.po
+index a2275d9..02c7a5a 100644
+--- a/po/zh_CN/plasma-camera.po
++++ b/po/zh_CN/plasma-camera.po
+@@ -71,6 +71,18 @@ msgid ""
+ "settings to improve performance."
+ msgstr "视频编码器无法流畅处理录像数据。请尝试降低录像设置以改善性能。"
+ 
++#: src/contents/ui/camera/CameraExtraControls.qml
++msgid "Autofocus"
++msgstr "自动对焦"
++
++#: src/contents/ui/camera/CameraPage.qml
++msgid "In focus"
++msgstr "对焦成功"
++
++#: src/contents/ui/camera/CameraPage.qml
++msgid "Could not focus"
++msgstr "对焦失败"
++
+ #: src/contents/ui/camera/CameraPage.qml:65
+ #, kde-format
+ msgid "Switch mode"
+diff --git a/src/contents/ui/camera/CameraExtraControls.qml b/src/contents/ui/camera/CameraExtraControls.qml
+index 697e782..159ebf4 100644
+--- a/src/contents/ui/camera/CameraExtraControls.qml
++++ b/src/contents/ui/camera/CameraExtraControls.qml
+@@ -16,6 +16,7 @@ Rectangle {
+     required property bool audioRecordingEnabled
+     required property bool audioRecordingEnabledShown
+     required property bool exposureValueEnabled
++    required property PlasmaCamera camera
+ 
+     signal audioEnabledChangeRequested(enabled: bool)
+     signal exposureValueRequested(value: real)
+@@ -56,6 +57,19 @@ Rectangle {
+                 QQC2.ToolTip.text: text
+             }
+ 
++            QQC2.ToolButton {
++                icon.name: "crosshairs-symbolic"
++                icon.color: "white"
++                visible: root.camera.available && root.camera.focusStatus !== PlasmaCamera.FocusUnavailable
++                enabled: !root.camera.busy && root.camera.focusStatus !== PlasmaCamera.Focusing
++                display: QQC2.ToolButton.IconOnly
++                text: i18n("Autofocus")
++                onClicked: root.camera.startAutoFocus()
++
++                QQC2.ToolTip.visible: down
++                QQC2.ToolTip.text: text
++            }
++
+             QQC2.ToolButton {
+                 id: exposureControlsButton
+                 icon.name: 'lighttable' // TODO: find better icon
+diff --git a/src/contents/ui/camera/CameraPage.qml b/src/contents/ui/camera/CameraPage.qml
+index 311d6c0..4353a37 100644
+--- a/src/contents/ui/camera/CameraPage.qml
++++ b/src/contents/ui/camera/CameraPage.qml
+@@ -48,6 +48,17 @@ Kirigami.Page {
+         }
+     }
+ 
++    Connections {
++        target: root.camera
++        function onFocusStatusChanged() {
++            if (root.camera.focusStatus === PlasmaCamera.Focused) {
++                showPassiveNotification(i18n("In focus"));
++            } else if (root.camera.focusStatus === PlasmaCamera.FocusFailed) {
++                showPassiveNotification(i18n("Could not focus"));
++            }
++        }
++    }
++
+     property CaptureController captureController: CaptureController {
+         id: captureController
+ 
+@@ -118,6 +129,7 @@ Kirigami.Page {
+             anchors.left: parent.left
+             anchors.right: parent.right
+ 
++            camera: root.camera
+             audioRecordingEnabled: root.captureSession.audioRecordingEnabled
+             audioRecordingEnabledShown: root.captureMode === CameraPage.CaptureMode.Video && !root.captureSession.isRecordingVideo && !root.captureSession.isSavingVideo
+             exposureValueEnabled: root.camera.exposureValueAvailable
+diff --git a/src/plasmacamera.cpp b/src/plasmacamera.cpp
+index 412cb28..a77516a 100644
+--- a/src/plasmacamera.cpp
++++ b/src/plasmacamera.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-FileCopyrightText: 2025 Devin Lin <devin@kde.org>
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <algorithm>
+ #include <map>
+ #include <unistd.h>
+ #include <sys/mman.h>
+@@ -60,6 +61,11 @@ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
+         setBusy(false);
+     });
+ 
++    connect(m_cameraWorker, &Worker::autoFocusFinished, this, [this](const QString &cameraId, bool focused) {
++        if (cameraId == m_cameraId && m_focusStatus == Focusing) {
++            setFocusStatus(focused ? Focused : FocusFailed);
++        }
++    });
+     // get errors from the camera worker
+     connect(m_cameraWorker, &Worker::errorOccurred, this, &PlasmaCamera::setError);
+ 
+@@ -187,6 +193,23 @@ bool PlasmaCamera::captureImage()
+     return true;
+ }
+ 
++void PlasmaCamera::setFocusStatus(FocusStatus status)
++{
++    if (m_focusStatus != status) {
++        m_focusStatus = status;
++        Q_EMIT focusStatusChanged();
++    }
++}
++
++void PlasmaCamera::startAutoFocus()
++{
++    if (!isAvailable() || busy() || m_focusStatus == FocusUnavailable || m_focusStatus == Focusing) {
++        return;
++    }
++    setFocusStatus(Focusing);
++    QMetaObject::invokeMethod(m_cameraWorker, &Worker::startAutoFocus, Qt::QueuedConnection);
++}
++
+ QSize PlasmaCamera::afWindow() const
+ {
+     return m_settings.getAfWindow();
+@@ -502,6 +525,8 @@ void PlasmaCamera::startCameraInternal()
+     m_camera = camera;
+     Q_EMIT cameraDeviceChanged(m_cameraId);
+ 
++    setFocusStatus(FocusUnavailable);
++
+     // Attempt to acquire lock on camera
+     // TODO: wait until camera becomes available before doing so?
+     if (!acquire()) {
+@@ -515,6 +540,7 @@ void PlasmaCamera::startCameraInternal()
+ void PlasmaCamera::stopCameraInternal()
+ {
+     setState(State::Stopping);
++    setFocusStatus(FocusUnavailable);
+ 
+     // Clear the current camera
+     m_cameraId.clear();
+@@ -594,6 +620,21 @@ bool PlasmaCamera::acquire()
+     // List camera properties
+     const libcamera::ControlInfoMap &infoMap = m_camera->controls();
+     qInfo() << "Acquired" << infoMap.size() << "controls";
++    const auto supports = [&infoMap](const libcamera::Control<int32_t> &control, int32_t value) {
++        const auto it = infoMap.find(&control);
++        if (it == infoMap.end()) {
++            return false;
++        }
++        const auto &values = it->second.values();
++        if (values.empty()) {
++            return it->second.min().get<int32_t>() <= value && value <= it->second.max().get<int32_t>();
++        }
++        return std::find(values.begin(), values.end(), libcamera::ControlValue(value)) != values.end();
++    };
++    if (supports(libcamera::controls::AfMode, libcamera::controls::AfModeAuto)
++        && supports(libcamera::controls::AfTrigger, libcamera::controls::AfTriggerStart)) {
++        setFocusStatus(FocusReady);
++    }
+ 
+     // Print camera properties
+     const libcamera::ControlList &properties = m_camera->properties();
+diff --git a/src/plasmacamera.h b/src/plasmacamera.h
+index 55b394c..518938c 100644
+--- a/src/plasmacamera.h
++++ b/src/plasmacamera.h
+@@ -55,6 +55,8 @@ class PlasmaCamera : public QObject
+     Q_PROPERTY(QString cameraDevice READ cameraDevice WRITE setCameraDevice NOTIFY cameraDeviceChanged)
+     Q_PROPERTY(QCameraFormat cameraFormat READ cameraFormat WRITE setCameraFormat NOTIFY cameraFormatChanged)
+ 
++    Q_PROPERTY(FocusStatus focusStatus READ focusStatus NOTIFY focusStatusChanged)
++
+     // Focus
+     // Q_PROPERTY(QSize afWindow READ afWindow WRITE setAfWindow RESET resetAfWindow NOTIFY afWindowChanged)
+ 
+@@ -73,6 +75,15 @@ class PlasmaCamera : public QObject
+     // Q_PROPERTY(int saturation READ saturation WRITE setSaturation RESET resetSaturation NOTIFY settingsChanged)
+ 
+ public:
++    enum FocusStatus {
++        FocusUnavailable,
++        FocusReady,
++        Focusing,
++        Focused,
++        FocusFailed
++    };
++    Q_ENUM(FocusStatus)
++
+     explicit PlasmaCamera(QObject *parent = nullptr);
+     ~PlasmaCamera() override;
+ 
+@@ -144,6 +155,8 @@ public:
+ 
+     // Focus
+     QSize afWindow() const;
++    FocusStatus focusStatus() const { return m_focusStatus; }
++    Q_INVOKABLE void startAutoFocus();
+ 
+     // Brightness
+     int iso() const;
+@@ -185,6 +198,7 @@ Q_SIGNALS:
+ 
+     // Focus
+     void afWindowChanged(const QSize &newAfWindow);
++    void focusStatusChanged();
+ 
+     // Settings
+     void settingsChanged(const Settings &settings);
+@@ -256,6 +270,7 @@ private:
+      * Set the busy state of the camera.
+      */
+     void setBusy(bool busy);
++    void setFocusStatus(FocusStatus status);
+ 
+     /*!
+      * Set the internal state of the camera object.
+@@ -282,6 +297,7 @@ private:
+     bool m_mirrorOutput = false;
+ 
+     Settings m_settings;
++    FocusStatus m_focusStatus = FocusUnavailable;
+ 
+     // Whether the camera has been requested to be active (see state for the actual camera state).
+     bool m_active = false;
+diff --git a/src/plasmacamera/worker.cpp b/src/plasmacamera/worker.cpp
+index 65a6b37..abe89b7 100644
+--- a/src/plasmacamera/worker.cpp
++++ b/src/plasmacamera/worker.cpp
+@@ -90,6 +90,13 @@ void Worker::capture()
+     setMode(CaptureMode::StillImage);
+ }
+ 
++void Worker::startAutoFocus()
++{
++    if (m_state == State::Running) {
++        m_focusScan = FocusScan::Pending;
++    }
++}
++
+ void Worker::setSettings(const Settings& settings)
+ {
+     m_settings = settings;
+@@ -168,8 +175,19 @@ void Worker::requestNextFrame()
+     // Load our settings onto the camera request's controls
+     m_settings.set(request->controls());
+ 
+-    // Queue request in camera for frame
+-    m_camera->queueRequest(request);
++    const bool triggerFocus = m_focusScan == FocusScan::Pending;
++    if (triggerFocus) {
++        request->controls().set(libcamera::controls::AfMode, libcamera::controls::AfModeAuto);
++        request->controls().set(libcamera::controls::AfTrigger, libcamera::controls::AfTriggerStart);
++        m_focusScan = FocusScan::Idle;
++    }
++
++    if (int ret = m_camera->queueRequest(request); ret < 0) {
++        if (triggerFocus) {
++            Q_EMIT autoFocusFinished(QString::fromStdString(m_camera->id()), false);
++        }
++        setError(ret);
++    }
+ }
+ 
+ void Worker::requestComplete(libcamera::Request *request)
+@@ -217,6 +235,27 @@ void Worker::processRequestDataAndEmit()
+     Q_EMIT viewFinderFrame(std::move(m_image));
+ }
+ 
++void Worker::readAutoFocusState(libcamera::Request &request)
++{
++    using namespace libcamera::controls;
++    // Older requests may still carry the result of a previous focus scan.
++    if (request.controls().get(AfTrigger) == AfTriggerStart) {
++        m_focusScan = FocusScan::WaitingForScan;
++    }
++    if (m_focusScan != FocusScan::WaitingForScan && m_focusScan != FocusScan::Scanning) {
++        return;
++    }
++
++    const auto state = request.metadata().get(AfState);
++    if (state == AfStateScanning) {
++        m_focusScan = FocusScan::Scanning;
++    } else if (state == AfStateFailed ||
++               (m_focusScan == FocusScan::Scanning && (state == AfStateFocused || state == AfStateIdle))) {
++        m_focusScan = FocusScan::Idle;
++        Q_EMIT autoFocusFinished(QString::fromStdString(m_camera->id()), state == AfStateFocused);
++    }
++}
++
+ void Worker::processRequestData()
+ {
+     libcamera::Request *request;
+@@ -233,6 +272,7 @@ void Worker::processRequestData()
+         return;
+     }
+ 
++    readAutoFocusState(*request);
+     libcamera::FrameBuffer *buffer = request->buffers().at(m_stream);
+     Image *image = m_mappedBuffers[buffer].get();
+ 
+@@ -293,6 +333,7 @@ void Worker::startViewFinder()
+ 
+ void Worker::stopViewFinder()
+ {
++    m_focusScan = FocusScan::Idle;
+     qDebug() << "stop view finder";
+     m_framePollTimer->stop();
+ 
+diff --git a/src/plasmacamera/worker.h b/src/plasmacamera/worker.h
+index f2e92c7..dd5b79d 100644
+--- a/src/plasmacamera/worker.h
++++ b/src/plasmacamera/worker.h
+@@ -43,6 +43,7 @@ Q_SIGNALS:
+ 
+     // Get supported features
+     void cameraFormatChanged();
++    void autoFocusFinished(const QString &cameraId, bool focused);
+     void supportedFeaturesChanged();
+ 
+     // Get frames
+@@ -68,6 +69,7 @@ public Q_SLOTS:
+ 
+     // Photo capture
+     void capture();
++    void startAutoFocus();
+ 
+     void setSettings(const Settings &settings);
+ 
+@@ -98,6 +100,8 @@ private:
+         Video,
+     };
+ 
++    enum class FocusScan { Idle, Pending, WaitingForScan, Scanning };
++    void readAutoFocusState(libcamera::Request &request);
+     void startViewFinder();
+     void stopViewFinder();
+ 
+@@ -129,6 +133,7 @@ private:
+     QTimer *m_framePollTimer = nullptr;
+ 
+     State m_state = State::None;
++    FocusScan m_focusScan = FocusScan::Idle;
+     CaptureMode m_mode = CaptureMode::None;
+ 
+     // internals

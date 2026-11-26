@@ -1,0 +1,285 @@
+From: Pixel 2 Linux project
+Subject: [PATCH] Keep the rear optical stabilizer open for its active preview
+
+Find the Walleye LC898123F40 V4L2 subdevice on the selected IMX362's
+firmware bus. The driver exports this control separately from the CAMSS
+image pipeline. Hold the descriptor only while the user has stabilization
+enabled, verify the standard control after each change and release it
+when disabling stabilization, switching cameras or leaving the preview.
+
+diff --git a/po/zh_CN/plasma-camera.po b/po/zh_CN/plasma-camera.po
+index 02c7a5a..e91151e 100644
+--- a/po/zh_CN/plasma-camera.po
++++ b/po/zh_CN/plasma-camera.po
+@@ -75,6 +75,14 @@ msgstr "视频编码器无法流畅处理录像数据。请尝试降低录像设
+ msgid "Autofocus"
+ msgstr "自动对焦"
+ 
++#: src/contents/ui/camera/CameraExtraControls.qml
++msgid "Turn off stabilization"
++msgstr "关闭防抖"
++
++#: src/contents/ui/camera/CameraExtraControls.qml
++msgid "Turn on stabilization"
++msgstr "开启防抖"
++
+ #: src/contents/ui/camera/CameraPage.qml
+ msgid "In focus"
+ msgstr "对焦成功"
+diff --git a/src/contents/ui/camera/CameraExtraControls.qml b/src/contents/ui/camera/CameraExtraControls.qml
+index 159ebf4..564ad99 100644
+--- a/src/contents/ui/camera/CameraExtraControls.qml
++++ b/src/contents/ui/camera/CameraExtraControls.qml
+@@ -83,6 +83,13 @@ Rectangle {
+                 QQC2.ToolTip.text: text
+             }
+ 
++            QQC2.ToolButton {
++                visible: root.camera.available && root.camera.stabilizationAvailable
++                enabled: !root.camera.busy
++                text: root.camera.stabilizationEnabled ? i18n("Turn off stabilization") : i18n("Turn on stabilization")
++                onClicked: root.camera.setStabilization(!root.camera.stabilizationEnabled)
++            }
++
+             Item { Layout.fillWidth: true }
+         }
+ 
+diff --git a/src/plasmacamera.cpp b/src/plasmacamera.cpp
+index a77516a..f38366f 100644
+--- a/src/plasmacamera.cpp
++++ b/src/plasmacamera.cpp
+@@ -66,6 +66,11 @@ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
+             setFocusStatus(focused ? Focused : FocusFailed);
+         }
+     });
++    connect(m_cameraWorker, &Worker::stabilizationChanged, this, [this](const QString &cameraId, bool available, bool enabled) {
++        if (cameraId == m_cameraId) {
++            setStabilizationState(available, enabled);
++        }
++    });
+     // get errors from the camera worker
+     connect(m_cameraWorker, &Worker::errorOccurred, this, &PlasmaCamera::setError);
+ 
+@@ -201,6 +206,22 @@ void PlasmaCamera::setFocusStatus(FocusStatus status)
+     }
+ }
+ 
++void PlasmaCamera::setStabilizationState(bool available, bool enabled)
++{
++    if (m_stabilizationAvailable != available || m_stabilizationEnabled != enabled) {
++        m_stabilizationAvailable = available;
++        m_stabilizationEnabled = enabled;
++        Q_EMIT stabilizationChanged();
++    }
++}
++
++void PlasmaCamera::setStabilization(bool enabled)
++{
++    if (isAvailable() && !busy() && m_stabilizationAvailable) {
++        QMetaObject::invokeMethod(m_cameraWorker, "setStabilization", Qt::QueuedConnection, Q_ARG(QString, m_cameraId), Q_ARG(bool, enabled));
++    }
++}
++
+ void PlasmaCamera::startAutoFocus()
+ {
+     if (!isAvailable() || busy() || m_focusStatus == FocusUnavailable || m_focusStatus == Focusing) {
+@@ -525,6 +546,7 @@ void PlasmaCamera::startCameraInternal()
+     m_camera = camera;
+     Q_EMIT cameraDeviceChanged(m_cameraId);
+ 
++    setStabilizationState(false, false);
+     setFocusStatus(FocusUnavailable);
+ 
+     // Attempt to acquire lock on camera
+@@ -540,6 +562,7 @@ void PlasmaCamera::startCameraInternal()
+ void PlasmaCamera::stopCameraInternal()
+ {
+     setState(State::Stopping);
++    setStabilizationState(false, false);
+     setFocusStatus(FocusUnavailable);
+ 
+     // Clear the current camera
+diff --git a/src/plasmacamera.h b/src/plasmacamera.h
+index 518938c..6acfe3d 100644
+--- a/src/plasmacamera.h
++++ b/src/plasmacamera.h
+@@ -56,6 +56,8 @@ class PlasmaCamera : public QObject
+     Q_PROPERTY(QCameraFormat cameraFormat READ cameraFormat WRITE setCameraFormat NOTIFY cameraFormatChanged)
+ 
+     Q_PROPERTY(FocusStatus focusStatus READ focusStatus NOTIFY focusStatusChanged)
++    Q_PROPERTY(bool stabilizationAvailable READ stabilizationAvailable NOTIFY stabilizationChanged)
++    Q_PROPERTY(bool stabilizationEnabled READ stabilizationEnabled NOTIFY stabilizationChanged)
+ 
+     // Focus
+     // Q_PROPERTY(QSize afWindow READ afWindow WRITE setAfWindow RESET resetAfWindow NOTIFY afWindowChanged)
+@@ -157,6 +159,9 @@ public:
+     QSize afWindow() const;
+     FocusStatus focusStatus() const { return m_focusStatus; }
+     Q_INVOKABLE void startAutoFocus();
++    bool stabilizationAvailable() const { return m_stabilizationAvailable; }
++    bool stabilizationEnabled() const { return m_stabilizationEnabled; }
++    Q_INVOKABLE void setStabilization(bool enabled);
+ 
+     // Brightness
+     int iso() const;
+@@ -199,6 +204,7 @@ Q_SIGNALS:
+     // Focus
+     void afWindowChanged(const QSize &newAfWindow);
+     void focusStatusChanged();
++    void stabilizationChanged();
+ 
+     // Settings
+     void settingsChanged(const Settings &settings);
+@@ -271,6 +277,7 @@ private:
+      */
+     void setBusy(bool busy);
+     void setFocusStatus(FocusStatus status);
++    void setStabilizationState(bool available, bool enabled);
+ 
+     /*!
+      * Set the internal state of the camera object.
+@@ -298,6 +305,8 @@ private:
+ 
+     Settings m_settings;
+     FocusStatus m_focusStatus = FocusUnavailable;
++    bool m_stabilizationAvailable = false;
++    bool m_stabilizationEnabled = false;
+ 
+     // Whether the camera has been requested to be active (see state for the actual camera state).
+     bool m_active = false;
+diff --git a/src/plasmacamera/worker.cpp b/src/plasmacamera/worker.cpp
+index abe89b7..c5a7d5d 100644
+--- a/src/plasmacamera/worker.cpp
++++ b/src/plasmacamera/worker.cpp
+@@ -3,6 +3,36 @@
+ 
+ #include "worker.h"
+ 
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <linux/videodev2.h>
++#include <sys/ioctl.h>
++
++static QString stabilizerNode(const libcamera::Camera &camera)
++{
++    if (camera.properties().get(libcamera::properties::Model) != "imx362") {
++        return {};
++    }
++    const QFileInfo sensor(QStringLiteral("/sys/firmware/devicetree") + QString::fromStdString(camera.id()));
++    if (!sensor.isDir()) {
++        return {};
++    }
++    const auto subdevices = QDir(QStringLiteral("/sys/class/video4linux")).entryInfoList({QStringLiteral("v4l-subdev*")}, QDir::Dirs);
++    for (const auto &subdevice : subdevices) {
++        const QString device = subdevice.filePath() + QStringLiteral("/device/");
++        const QFileInfo driver(QFileInfo(device + QStringLiteral("driver")).canonicalFilePath());
++        const QFileInfo node(QFileInfo(device + QStringLiteral("of_node")).canonicalFilePath());
++        if (driver.fileName() == QLatin1String("lc898123f40") && node.isDir() && node.absolutePath() == sensor.absolutePath()) {
++            return QStringLiteral("/dev/") + subdevice.fileName();
++        }
++    }
++    return {};
++}
++
+ static const QMap<libcamera::PixelFormat, QImage::Format> NATIVE_FORMATS{
+     {libcamera::formats::ABGR8888, QImage::Format_RGBX8888},
+     {libcamera::formats::XBGR8888, QImage::Format_RGBX8888},
+@@ -102,6 +132,40 @@ void Worker::setSettings(const Settings& settings)
+     m_settings = settings;
+ }
+ 
++void Worker::setStabilization(const QString &cameraId, bool enabled)
++{
++    if (!m_camera || QString::fromStdString(m_camera->id()) != cameraId || m_stabilizerNode.isEmpty()
++        || (enabled && m_state != State::Running) || enabled == m_stabilizer.isValid()) {
++        return;
++    }
++    if (enabled) {
++        m_stabilizer.reset(::open(QFile::encodeName(m_stabilizerNode).constData(), O_RDWR | O_CLOEXEC));
++    }
++
++    v4l2_control control{};
++    control.id = V4L2_CID_IMAGE_STABILIZATION;
++    control.value = enabled;
++    int error = 0;
++    if (!m_stabilizer.isValid()
++        || ioctl(m_stabilizer.get(), static_cast<int>(VIDIOC_S_CTRL), &control) < 0
++        || ioctl(m_stabilizer.get(), static_cast<int>(VIDIOC_G_CTRL), &control) < 0) {
++        error = errno;
++    } else if (control.value != int(enabled)) {
++        error = EIO;
++    }
++    if (error || !enabled) {
++        m_stabilizer.reset();
++    }
++    if (error) {
++        const QString path = m_stabilizerNode;
++        m_stabilizerNode.clear();
++        Q_EMIT stabilizationChanged(cameraId, false, false);
++        setError(QStringLiteral("%1 (%2): %3").arg(QStringLiteral("V4L2 image stabilization"), path, QString::fromLocal8Bit(strerror(error))));
++        return;
++    }
++    Q_EMIT stabilizationChanged(cameraId, true, enabled);
++}
++
+ void Worker::setError(const QString &errorString)
+ {
+     m_error = true;
+@@ -329,10 +393,16 @@ void Worker::startViewFinder()
+ 
+     // Start polling for frames
+     m_framePollTimer->start();
++    m_stabilizerNode = stabilizerNode(*m_camera);
++    Q_EMIT stabilizationChanged(QString::fromStdString(m_camera->id()), !m_stabilizerNode.isEmpty(), false);
+ }
+ 
+ void Worker::stopViewFinder()
+ {
++    if (m_stabilizer.isValid()) {
++        setStabilization(QString::fromStdString(m_camera->id()), false);
++    }
++    m_stabilizerNode.clear();
+     m_focusScan = FocusScan::Idle;
+     qDebug() << "stop view finder";
+     m_framePollTimer->stop();
+diff --git a/src/plasmacamera/worker.h b/src/plasmacamera/worker.h
+index dd5b79d..e08a2c1 100644
+--- a/src/plasmacamera/worker.h
++++ b/src/plasmacamera/worker.h
+@@ -13,6 +13,7 @@
+ #include <QCameraFormat>
+ 
+ #include <memory>
++#include <libcamera/base/unique_fd.h>
+ #include <libcamera/libcamera.h>
+ #include <libcamera/framebuffer.h>
+ 
+@@ -44,6 +45,7 @@ Q_SIGNALS:
+     // Get supported features
+     void cameraFormatChanged();
+     void autoFocusFinished(const QString &cameraId, bool focused);
++    void stabilizationChanged(const QString &cameraId, bool available, bool enabled);
+     void supportedFeaturesChanged();
+ 
+     // Get frames
+@@ -70,6 +72,7 @@ public Q_SLOTS:
+     // Photo capture
+     void capture();
+     void startAutoFocus();
++    void setStabilization(const QString &cameraId, bool enabled);
+ 
+     void setSettings(const Settings &settings);
+ 
+@@ -134,6 +137,8 @@ private:
+ 
+     State m_state = State::None;
+     FocusScan m_focusScan = FocusScan::Idle;
++    QString m_stabilizerNode;
++    libcamera::UniqueFD m_stabilizer;
+     CaptureMode m_mode = CaptureMode::None;
+ 
+     // internals

@@ -1,0 +1,10 @@
+--- a/containments/homescreens/folio/qml/FolioHomeScreen.qml
++++ b/containments/homescreens/folio/qml/FolioHomeScreen.qml
+@@ -518,6 +518,5 @@
+                 homeScreen: root
+ 
+-                // we only start showing it halfway through
+-                opacity: homeScreenState.appDrawerOpenProgress < 0.5 ? 0 : (homeScreenState.appDrawerOpenProgress - 0.5) * 2
++                opacity: homeScreenState.appDrawerOpenProgress
+ 
+                 // position for animation

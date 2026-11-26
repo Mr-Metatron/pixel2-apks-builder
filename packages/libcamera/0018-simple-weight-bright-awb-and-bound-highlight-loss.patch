@@ -1,0 +1,196 @@
+Subject: [PATCH] ipa: simple: tune bright-surface white balance and limit highlight priority
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index d9d0d9b..05b000a 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -43,6 +43,10 @@ struct SwIspStats {
+ 	 * \brief A histogram of luminance values of all the sampled pixels
+ 	 */
+ 	Histogram yHistogram;
++
++	/* Bright, unclipped packed RAW10 samples for optional AWB weighting. */
++	RGB<uint64_t> brightSum;
++	uint32_t brightCount;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index e636e2c..4a6cb48 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -42,6 +42,12 @@ static constexpr float kExposureSatisfactory = 0.2;
+ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
+ 	protectHighlights_ = tuningData["protectHighlights"].get<bool>(false);
++	if (tuningData.contains("maxHighlightLossEv")) {
++		auto stops = tuningData["maxHighlightLossEv"].get<double>();
++		if (!stops || !std::isfinite(*stops) || *stops < 0)
++			return -EINVAL;
++		minimumMiddleFraction_ = std::exp2(-*stops);
++	}
+ 	if (protectHighlights_)
+ 		context.ctrlMap[&controls::ExposureValue] = ControlInfo(-2.0f, 2.0f, 0.0f);
+ 	return 0;
+@@ -68,7 +74,9 @@ void Agc::meterHighlights(IPAContext &context, IPAFrameContext &frameContext, co
+ 	 */
+ 	const double middle = std::max(hist.interQuantileMean(0.05, 0.95) - black, 0.5);
+ 	const double highlights = std::max(hist.quantile(0.99) - black, 0.5);
+-	const double ratio = std::min(0.18 * range / middle, 0.90 * range / highlights) *
++	const double midRatio = 0.18 * range / middle;
++	const double highlightRatio = 0.90 * range / highlights;
++	const double ratio = std::clamp(highlightRatio, minimumMiddleFraction_ * midRatio, midRatio) *
+ 			     std::exp2(frameContext.ev);
+ 	if (std::abs(ratio - 1.0) < 0.05)
+ 		return;
+diff --git a/src/ipa/simple/algorithms/agc.h b/src/ipa/simple/algorithms/agc.h
+index a0fdd85..a67228e 100644
+--- a/src/ipa/simple/algorithms/agc.h
++++ b/src/ipa/simple/algorithms/agc.h
+@@ -29,6 +29,7 @@ public:
+ private:
+ 	void meterHighlights(IPAContext &context, IPAFrameContext &frameContext, const SwIspStats &stats);
+ 	bool protectHighlights_ = false;
++	double minimumMiddleFraction_ = 0.0;
+ 	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
+ };
+ 
+diff --git a/src/ipa/simple/algorithms/awb.cpp b/src/ipa/simple/algorithms/awb.cpp
+index f5c88ea..c2c8278 100644
+--- a/src/ipa/simple/algorithms/awb.cpp
++++ b/src/ipa/simple/algorithms/awb.cpp
+@@ -23,6 +23,12 @@ LOG_DEFINE_CATEGORY(IPASoftAwb)
+ 
+ namespace ipa::soft::algorithms {
+ 
++int Awb::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	weightBrightPixels_ = tuningData["weightBrightPixels"].get<bool>(false);
++	return 0;
++}
++
+ int Awb::configure(IPAContext &context,
+ 		   [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
+@@ -73,15 +79,21 @@ void Awb::process(IPAContext &context,
+ 	 * would be off if they were computed from the whole brightness range
+ 	 * rather than from the sensor range.
+ 	 */
+-	const uint64_t nPixels = std::accumulate(
++	uint64_t nPixels = std::accumulate(
+ 		histogram.begin(), histogram.end(), uint64_t(0));
++	RGB<uint64_t> sums = stats->sum_;
++	if (weightBrightPixels_) {
++		/* Three votes for bright, unclipped surfaces; one for every other sample. */
++		sums += stats->brightSum * 2;
++		nPixels += 2ULL * stats->brightCount;
++	}
+ 	const uint64_t offset = blackLevel * nPixels;
+ 	const uint64_t minValid = 1;
+ 	/*
+ 	 * Make sure the sums are at least minValid, while preventing unsigned
+ 	 * integer underflow.
+ 	 */
+-	const RGB<uint64_t> sum = stats->sum_.max(offset + minValid) - offset;
++	const RGB<uint64_t> sum = sums.max(offset + minValid) - offset;
+ 
+ 	/*
+ 	 * Calculate red and blue gains for AWB.
+diff --git a/src/ipa/simple/algorithms/awb.h b/src/ipa/simple/algorithms/awb.h
+index ad993f3..3b886a8 100644
+--- a/src/ipa/simple/algorithms/awb.h
++++ b/src/ipa/simple/algorithms/awb.h
+@@ -19,6 +19,7 @@ public:
+ 	Awb() = default;
+ 	~Awb() = default;
+ 
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 	void prepare(IPAContext &context,
+ 		     const uint32_t frame,
+@@ -29,6 +30,9 @@ public:
+ 		     IPAFrameContext &frameContext,
+ 		     const SwIspStats *stats,
+ 		     ControlList &metadata) override;
++
++private:
++	bool weightBrightPixels_ = false;
+ };
+ 
+ } /* namespace ipa::soft::algorithms */
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index be696a6..0e2ad06 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include "libcamera/internal/software_isp/swstats_cpu.h"
+ 
++#include <algorithm>
++
+ #include <libcamera/base/log.h>
+ 
+ #include <libcamera/stream.h>
+@@ -272,6 +274,20 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
++static inline void collectBrightSample(SwIspStats &stats, uint8_t r, uint8_t g, uint8_t b,
++				       uint64_t weightedY)
++{
++	/* Give brighter surfaces more influence, excluding nearly clipped channels.
++	 * weightedY is the 8-bit Bayer luminance times 256, before white balance.
++	 */
++	if (weightedY >= 64 * 256 && std::max({ r, g, b }) < 240) {
++		stats.brightSum.r() += r;
++		stats.brightSum.g() += g;
++		stats.brightSum.b() += b;
++		++stats.brightCount;
++	}
++}
++
+ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 5 / 4;
+@@ -293,6 +309,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		collectBrightSample(stats, r, g, b, yVal);
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -319,6 +336,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 		g = (g + g2) / 2;
+ 		/* Data is already 8 bits, divide by 1 */
+ 		SWSTATS_ACCUMULATE_LINE_STATS(1)
++		collectBrightSample(stats, r, g, b, yVal);
+ 	}
+ 
+ 	SWSTATS_FINISH_LINE_STATS()
+@@ -374,6 +392,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		s.brightSum = RGB<uint64_t>({ 0, 0, 0 });
++		s.brightCount = 0;
+ 		s.yHistogram.fill(0);
+ 		s.focusGradient = 0;
+ 		s.focusIntensity = 0;
+@@ -398,12 +418,16 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 		uint64_t intensity = 0;
+ 		unsigned int samples = 0;
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->brightSum = RGB<uint64_t>({ 0, 0, 0 });
++		sharedStats_->brightCount = 0;
+ 		sharedStats_->yHistogram.fill(0);
+ 		for (const auto &s : stats_) {
+ 			gradient += s.focusGradient;
+ 			intensity += s.focusIntensity;
+ 			samples += s.focusSamples;
+ 			sharedStats_->sum_ += s.sum_;
++			sharedStats_->brightSum += s.brightSum;
++			sharedStats_->brightCount += s.brightCount;
+ 			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
+ 		}

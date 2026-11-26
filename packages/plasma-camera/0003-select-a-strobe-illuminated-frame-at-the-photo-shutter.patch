@@ -1,0 +1,970 @@
+From: Pixel 2 Linux project
+Subject: [PATCH] Capture stills with the Walleye rear camera flash
+
+Open the IMX362 sensor and its linked two-channel flash device for a still
+capture. Arm a bounded V4L2 software strobe so the PMIC switches both
+outputs together. Use the sensor timing and captured buffer timestamp to
+select the frame for the JPEG, and report errors to the original camera UI.
+Enable the still shutter when the camera is ready to take the photo.
+
+diff --git a/po/zh_CN/plasma-camera.po b/po/zh_CN/plasma-camera.po
+index e91151e..2e02244 100644
+--- a/po/zh_CN/plasma-camera.po
++++ b/po/zh_CN/plasma-camera.po
+@@ -270,3 +270,40 @@ msgstr "Andrew Wang"
+ #, kde-format
+ msgid "Devin Lin"
+ msgstr "Devin Lin"
++
++#: src/contents/ui/camera/CameraExtraControls.qml
++msgid "Turn on photo flash"
++msgstr "开启拍照闪光灯"
++
++#: src/contents/ui/camera/CameraExtraControls.qml
++msgid "Turn off photo flash"
++msgstr "关闭拍照闪光灯"
++
++#: src/contents/ui/camera/CameraPage.qml
++#, kde-format
++msgid "Could not take the photo: %1"
++msgstr "照片未能拍摄：%1"
++
++#: src/plasmacamera/worker.cpp
++msgid "The camera is not ready."
++msgstr "相机尚未就绪。"
++
++#: src/plasmacamera/worker.cpp
++msgid "The selected camera has no photo flash."
++msgstr "当前摄像头没有可用的拍照闪光灯。"
++
++#: src/plasmacamera/worker.cpp
++msgid "The current sensor timing cannot be used for flash."
++msgstr "当前传感器时序不支持本次闪光拍摄。"
++
++#: src/plasmacamera/worker.cpp
++msgid "The flash interval was too short for the current exposure."
++msgstr "闪光持续时间不足以完成当前曝光。"
++
++#: src/plasmacamera/worker.cpp
++msgid "No complete exposure arrived during the flash."
++msgstr "未收到曝光完整落在闪光时段内的图像。"
++
++#: src/plasmacamera/worker.cpp
++msgid "The camera stopped before the flash photo was captured."
++msgstr "相机已在闪光照片拍摄完成前停止。"
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 0c676f7..7a577a3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -11,6 +11,7 @@ set(plasma-camera_SRCS
+     plasmacamera/converter.cpp
+     plasmacamera/image.cpp
+     plasmacamera/path.cpp
++    plasmacamera/photoflash.cpp
+     plasmacamera/settings.cpp
+     plasmacamera/worker.cpp
+     resources.qrc
+diff --git a/src/contents/ui/camera/CameraControls.qml b/src/contents/ui/camera/CameraControls.qml
+index 70bc658..6c33c28 100644
+--- a/src/contents/ui/camera/CameraControls.qml
++++ b/src/contents/ui/camera/CameraControls.qml
+@@ -75,15 +75,12 @@ Rectangle {
+                     }
+                     function updatePreview(_, fileName: string) {
+                         previewArea.imageUrl = "file://" + fileName;
++                        previewArea.setPhotoPreview();
+                     }
+ 
+-                    // Listen for photo capture and video capture events
+                     Connections {
+                         target: root.captureController
+ 
+-                        function onPhotoCaptured() {
+-                            previewArea.setPhotoPreview();
+-                        }
+                         function onVideoCaptured() {
+                             previewArea.setVideoPreview();
+                         }
+@@ -115,6 +112,7 @@ Rectangle {
+             // Capture photo/video button
+             CaptureButton {
+                 id: captureButton
++                Accessible.name: root.captureController.intendedText
+                 captureMode: root.captureMode
+                 isRecording: captureController.isRecording
+                 enabled: root.captureEnabled
+@@ -179,4 +177,4 @@ Rectangle {
+             ]
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/contents/ui/camera/CameraExtraControls.qml b/src/contents/ui/camera/CameraExtraControls.qml
+index 564ad99..9f78190 100644
+--- a/src/contents/ui/camera/CameraExtraControls.qml
++++ b/src/contents/ui/camera/CameraExtraControls.qml
+@@ -16,6 +16,7 @@ Rectangle {
+     required property bool audioRecordingEnabled
+     required property bool audioRecordingEnabledShown
+     required property bool exposureValueEnabled
++    required property bool photoMode
+     required property PlasmaCamera camera
+ 
+     signal audioEnabledChangeRequested(enabled: bool)
+@@ -83,6 +84,17 @@ Rectangle {
+                 QQC2.ToolTip.text: text
+             }
+ 
++            QQC2.ToolButton {
++                visible: root.photoMode && root.camera.available && root.camera.photoFlashAvailable
++                enabled: !root.camera.busy
++                icon.source: root.camera.photoFlashEnabled ? "qrc:/camera_flash_fill.png" : "qrc:/camera_flash_off.png"
++                display: QQC2.ToolButton.IconOnly
++                text: root.camera.photoFlashEnabled ? i18n("Turn off photo flash") : i18n("Turn on photo flash")
++                onClicked: root.camera.photoFlashEnabled = !root.camera.photoFlashEnabled
++                QQC2.ToolTip.visible: down
++                QQC2.ToolTip.text: text
++            }
++
+             QQC2.ToolButton {
+                 visible: root.camera.available && root.camera.stabilizationAvailable
+                 enabled: !root.camera.busy
+diff --git a/src/contents/ui/camera/CameraPage.qml b/src/contents/ui/camera/CameraPage.qml
+index 4353a37..134471a 100644
+--- a/src/contents/ui/camera/CameraPage.qml
++++ b/src/contents/ui/camera/CameraPage.qml
+@@ -50,6 +50,9 @@ Kirigami.Page {
+ 
+     Connections {
+         target: root.camera
++        function onCaptureFailed(reason) {
++            showPassiveNotification(i18n("Could not take the photo: %1", reason));
++        }
+         function onFocusStatusChanged() {
+             if (root.camera.focusStatus === PlasmaCamera.Focused) {
+                 showPassiveNotification(i18n("In focus"));
+@@ -99,6 +102,7 @@ Kirigami.Page {
+             onTriggered: root.captureController.requestCapture()
+ 
+             enabled: !camera.busy
++                && (root.captureMode !== CameraPage.CaptureMode.Photo || root.captureSession.readyForCapture)
+                 && !root.captureController.captureTimerRunning
+                 && !root.captureSession.isSavingVideo
+         },
+@@ -130,6 +134,7 @@ Kirigami.Page {
+             anchors.right: parent.right
+ 
+             camera: root.camera
++            photoMode: root.captureMode === CameraPage.CaptureMode.Photo
+             audioRecordingEnabled: root.captureSession.audioRecordingEnabled
+             audioRecordingEnabledShown: root.captureMode === CameraPage.CaptureMode.Video && !root.captureSession.isRecordingVideo && !root.captureSession.isSavingVideo
+             exposureValueEnabled: root.camera.exposureValueAvailable
+diff --git a/src/contents/ui/camera/CaptureController.qml b/src/contents/ui/camera/CaptureController.qml
+index 79509ce..cf0770e 100644
+--- a/src/contents/ui/camera/CaptureController.qml
++++ b/src/contents/ui/camera/CaptureController.qml
+@@ -73,7 +73,6 @@ QtObject {
+     }
+ 
+     // Emitted when a photo was captured
+-    signal photoCaptured()
+ 
+     // Emitted when a video was captured
+     signal videoCaptured()
+@@ -89,8 +88,6 @@ QtObject {
+             if (root.captureMode === CameraPage.CaptureMode.Photo) {
+                 if (root.captureSession.readyForCapture) {
+                     root.captureSession.captureImageToFile("");
+-                    console.log("Took a photo");
+-                    root.photoCaptured();
+                 } else {
+                     showPassiveNotification(i18n("Failed to take a photo"));
+                 }
+@@ -129,4 +126,4 @@ QtObject {
+             countdownTimer.countdownRemainingSeconds--;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/src/plasmacamera.cpp b/src/plasmacamera.cpp
+index f38366f..36ff701 100644
+--- a/src/plasmacamera.cpp
++++ b/src/plasmacamera.cpp
+@@ -71,6 +71,17 @@ PlasmaCamera::PlasmaCamera(QObject *parent) : QObject(parent)
+             setStabilizationState(available, enabled);
+         }
+     });
++    connect(m_cameraWorker, &Worker::photoFlashAvailable, this, [this](const QString &cameraId, bool available) {
++        if (cameraId == m_cameraId) {
++            setPhotoFlashAvailable(available);
++        }
++    });
++    connect(m_cameraWorker, &Worker::captureFailed, this, [this](const QString &cameraId, const QString &reason) {
++        if (cameraId == m_cameraId) {
++            setBusy(false);
++            Q_EMIT captureFailed(reason);
++        }
++    });
+     // get errors from the camera worker
+     connect(m_cameraWorker, &Worker::errorOccurred, this, &PlasmaCamera::setError);
+ 
+@@ -188,12 +199,13 @@ QCameraFormat PlasmaCamera::cameraFormat() const
+ 
+ bool PlasmaCamera::captureImage()
+ {
+-    if (m_state != State::Running) {
++    if (m_state != State::Running || busy()) {
+         return false;
+     }
+ 
+     setBusy(true);
+-    QMetaObject::invokeMethod(m_cameraWorker, "capture", Qt::QueuedConnection);
++    QMetaObject::invokeMethod(m_cameraWorker, "capture", Qt::QueuedConnection,
++                              Q_ARG(QString, m_cameraId), Q_ARG(bool, m_photoFlashEnabled));
+ 
+     return true;
+ }
+@@ -222,6 +234,23 @@ void PlasmaCamera::setStabilization(bool enabled)
+     }
+ }
+ 
++void PlasmaCamera::setPhotoFlashAvailable(bool available)
++{
++    if (m_photoFlashAvailable != available) {
++        m_photoFlashAvailable = available;
++        m_photoFlashEnabled = false;
++        Q_EMIT photoFlashChanged();
++    }
++}
++
++void PlasmaCamera::setPhotoFlashEnabled(bool enabled)
++{
++    if (!busy() && m_photoFlashAvailable && m_photoFlashEnabled != enabled) {
++        m_photoFlashEnabled = enabled;
++        Q_EMIT photoFlashChanged();
++    }
++}
++
+ void PlasmaCamera::startAutoFocus()
+ {
+     if (!isAvailable() || busy() || m_focusStatus == FocusUnavailable || m_focusStatus == Focusing) {
+@@ -547,6 +576,7 @@ void PlasmaCamera::startCameraInternal()
+     Q_EMIT cameraDeviceChanged(m_cameraId);
+ 
+     setStabilizationState(false, false);
++    setPhotoFlashAvailable(false);
+     setFocusStatus(FocusUnavailable);
+ 
+     // Attempt to acquire lock on camera
+@@ -563,6 +593,7 @@ void PlasmaCamera::stopCameraInternal()
+ {
+     setState(State::Stopping);
+     setStabilizationState(false, false);
++    setPhotoFlashAvailable(false);
+     setFocusStatus(FocusUnavailable);
+ 
+     // Clear the current camera
+diff --git a/src/plasmacamera.h b/src/plasmacamera.h
+index 6acfe3d..d87abf8 100644
+--- a/src/plasmacamera.h
++++ b/src/plasmacamera.h
+@@ -58,6 +58,8 @@ class PlasmaCamera : public QObject
+     Q_PROPERTY(FocusStatus focusStatus READ focusStatus NOTIFY focusStatusChanged)
+     Q_PROPERTY(bool stabilizationAvailable READ stabilizationAvailable NOTIFY stabilizationChanged)
+     Q_PROPERTY(bool stabilizationEnabled READ stabilizationEnabled NOTIFY stabilizationChanged)
++    Q_PROPERTY(bool photoFlashAvailable READ photoFlashAvailable NOTIFY photoFlashChanged)
++    Q_PROPERTY(bool photoFlashEnabled READ photoFlashEnabled WRITE setPhotoFlashEnabled NOTIFY photoFlashChanged)
+ 
+     // Focus
+     // Q_PROPERTY(QSize afWindow READ afWindow WRITE setAfWindow RESET resetAfWindow NOTIFY afWindowChanged)
+@@ -162,6 +164,9 @@ public:
+     bool stabilizationAvailable() const { return m_stabilizationAvailable; }
+     bool stabilizationEnabled() const { return m_stabilizationEnabled; }
+     Q_INVOKABLE void setStabilization(bool enabled);
++    bool photoFlashAvailable() const { return m_photoFlashAvailable; }
++    bool photoFlashEnabled() const { return m_photoFlashEnabled; }
++    void setPhotoFlashEnabled(bool enabled);
+ 
+     // Brightness
+     int iso() const;
+@@ -205,6 +210,8 @@ Q_SIGNALS:
+     void afWindowChanged(const QSize &newAfWindow);
+     void focusStatusChanged();
+     void stabilizationChanged();
++    void photoFlashChanged();
++    void captureFailed(const QString &reason);
+ 
+     // Settings
+     void settingsChanged(const Settings &settings);
+@@ -307,6 +314,9 @@ private:
+     FocusStatus m_focusStatus = FocusUnavailable;
+     bool m_stabilizationAvailable = false;
+     bool m_stabilizationEnabled = false;
++    void setPhotoFlashAvailable(bool available);
++    bool m_photoFlashAvailable = false;
++    bool m_photoFlashEnabled = false;
+ 
+     // Whether the camera has been requested to be active (see state for the actual camera state).
+     bool m_active = false;
+diff --git a/src/plasmacamera/photoflash.cpp b/src/plasmacamera/photoflash.cpp
+new file mode 100644
+index 0000000..badc694
+--- /dev/null
++++ b/src/plasmacamera/photoflash.cpp
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "photoflash.h"
++
++#include <QDebug>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QStringList>
++#include <array>
++#include <cerrno>
++#include <cstring>
++#include <fcntl.h>
++#include <linux/videodev2.h>
++#include <sys/file.h>
++#include <sys/ioctl.h>
++#include <time.h>
++#include <utility>
++#include <libcamera/libcamera.h>
++
++namespace
++{
++QByteArray readProperty(const QString &path)
++{
++    QFile file(path);
++    if (!file.open(QIODevice::ReadOnly)) {
++        return {};
++    }
++    return file.readAll();
++}
++
++int monotonicTime(uint64_t &ns)
++{
++    timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
++        return errno;
++    }
++    ns = uint64_t(now.tv_sec) * 1000000000 + now.tv_nsec;
++    return 0;
++}
++
++int getControl(int fd, uint32_t id, int &value)
++{
++    v4l2_control control{};
++    control.id = id;
++    if (ioctl(fd, static_cast<int>(VIDIOC_G_CTRL), &control) < 0) {
++        return errno;
++    }
++    value = control.value;
++    return 0;
++}
++
++int setControl(int fd, uint32_t id, int value)
++{
++    v4l2_control control{};
++    control.id = id;
++    control.value = value;
++    return ioctl(fd, static_cast<int>(VIDIOC_S_CTRL), &control) < 0 ? errno : 0;
++}
++
++int setAndRead(int fd, uint32_t id, int value)
++{
++    int actual = 0;
++    if (int error = setControl(fd, id, value)) {
++        return error;
++    }
++    if (int error = getControl(fd, id, actual)) {
++        return error;
++    }
++    return value == actual ? 0 : EIO;
++}
++
++int configureFlash(int fd, int timeoutUs)
++{
++    // One logical source shares the current between two outputs in 25 mA steps.
++    std::array<v4l2_ext_control, 4> desired{};
++    desired[0].id = V4L2_CID_FLASH_INTENSITY;
++    desired[0].value = 2000000;
++    desired[1].id = V4L2_CID_FLASH_TIMEOUT;
++    desired[1].value = timeoutUs;
++    desired[2].id = V4L2_CID_FLASH_STROBE_SOURCE;
++    desired[2].value = V4L2_FLASH_STROBE_SOURCE_SOFTWARE;
++    desired[3].id = V4L2_CID_FLASH_LED_MODE;
++    desired[3].value = V4L2_FLASH_LED_MODE_FLASH;
++
++    auto values = desired;
++    v4l2_ext_controls group{};
++    group.count = static_cast<uint32_t>(values.size());
++    group.controls = values.data();
++    // The exposure window relies on the exact timeout accepted by the driver.
++    for (int command : {static_cast<int>(VIDIOC_TRY_EXT_CTRLS), static_cast<int>(VIDIOC_S_EXT_CTRLS), static_cast<int>(VIDIOC_G_EXT_CTRLS)}) {
++        if (ioctl(fd, command, &group) < 0) {
++            return errno;
++        }
++        for (size_t i = 0; i < values.size(); ++i) {
++            if (values[i].value != desired[i].value) {
++                return ERANGE;
++            }
++        }
++    }
++    return 0;
++}
++
++QString flashError(const char *operation, int error)
++{
++    return QStringLiteral("Flash %1: %2").arg(QString::fromLatin1(operation), QString::fromLocal8Bit(strerror(error)));
++}
++
++QString flashFault(int faults)
++{
++    return QStringLiteral("V4L2 flash fault 0x%1").arg(faults, 0, 16);
++}
++}
++
++PhotoFlash::Devices PhotoFlash::nodes(const libcamera::Camera &camera)
++{
++    if (camera.properties().get(libcamera::properties::Model) != "imx362") {
++        return {};
++    }
++    const QString sensor = QFileInfo(QStringLiteral("/sys/firmware/devicetree") + QString::fromStdString(camera.id())).canonicalFilePath();
++    if (sensor.isEmpty()) {
++        return {};
++    }
++    const auto reference = readProperty(sensor + QStringLiteral("/flash-leds"));
++    if (reference.size() != 4) {
++        return {};
++    }
++
++    Devices result;
++    const auto subdevices = QDir(QStringLiteral("/sys/class/video4linux")).entryInfoList({QStringLiteral("v4l-subdev*")}, QDir::Dirs);
++    for (const auto &subdevice : subdevices) {
++        const QString parent = QFileInfo(subdevice.filePath() + QStringLiteral("/device/of_node")).canonicalFilePath();
++        const QString device = QStringLiteral("/dev/") + subdevice.fileName();
++        if (parent == sensor) {
++            result.sensor = device;
++            continue;
++        }
++        if (readProperty(subdevice.filePath() + QStringLiteral("/name")).trimmed() != ":flash" ||
++            parent.isEmpty() || !readProperty(parent + QStringLiteral("/compatible")).split('\0').contains("qcom,pmi8998-flash-led")) {
++            continue;
++        }
++        // The subdevice points to its PMIC parent. Match the sensor's single
++        // flash phandle to the unnumbered LED that drives both physical outputs.
++        const auto children = QDir(parent).entryInfoList({QStringLiteral("led-*")}, QDir::Dirs);
++        for (const auto &child : children) {
++            const QString path = child.filePath();
++            if (readProperty(path + QStringLiteral("/phandle")) == reference &&
++                readProperty(path + QStringLiteral("/function")) == QByteArray("flash\0", 6) &&
++                !QFile::exists(path + QStringLiteral("/function-enumerator")) &&
++                readProperty(path + QStringLiteral("/led-sources")) == QByteArray::fromHex("0000000100000002")) {
++                result.led = device;
++            }
++        }
++    }
++    return result;
++}
++
++QString PhotoFlash::start(const QString &led, unsigned int requestedTimeoutUs, Pulse &pulse)
++{
++    pulse = {};
++    if (m_fd.isValid() || led.isEmpty() || !requestedTimeoutUs || requestedTimeoutUs > 1280000) {
++        return QStringLiteral("Invalid flash request");
++    }
++
++    libcamera::UniqueFD device(open(QFile::encodeName(led).constData(), O_RDWR | O_CLOEXEC));
++    const int fd = device.get();
++    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) < 0) {
++        return flashError("acquire flash", errno);
++    }
++    int mode = 0, strobing = 0, faults = 0;
++    if (int error = getControl(fd, V4L2_CID_FLASH_LED_MODE, mode)) {
++        return flashError("read mode", error);
++    }
++    if (int error = getControl(fd, V4L2_CID_FLASH_STROBE_STATUS, strobing)) {
++        return flashError("read strobe state", error);
++    }
++    if (mode != V4L2_FLASH_LED_MODE_NONE || strobing) {
++        return flashError("acquire flash", EBUSY);
++    }
++    if (int error = getControl(fd, V4L2_CID_FLASH_FAULT, faults)) {
++        return flashError("read fault", error);
++    }
++    if (faults) {
++        return flashFault(faults);
++    }
++
++    m_fd = std::move(device);
++    auto fail = [this](const QString &reason) {
++        const QString cleanup = finish();
++        return cleanup.isEmpty() ? reason : reason + QLatin1Char('\n') + cleanup;
++    };
++    if (int error = configureFlash(fd, int(requestedTimeoutUs))) {
++        return fail(flashError("configure software strobe", error));
++    }
++    uint64_t before = 0, after = 0;
++    if (int error = monotonicTime(before)) {
++        return fail(flashError("read monotonic clock", error));
++    }
++    m_earliestExpiryNs = before + uint64_t(requestedTimeoutUs) * 1000;
++    if (int error = setControl(fd, V4L2_CID_FLASH_STROBE, 1)) {
++        return fail(flashError("trigger flash", error));
++    }
++    if (int error = monotonicTime(after)) {
++        return fail(flashError("read monotonic clock", error));
++    }
++    if (after >= m_earliestExpiryNs) {
++        return fail(QStringLiteral("The flash deadline elapsed during the trigger"));
++    }
++    pulse = {after, m_earliestExpiryNs};
++    return {};
++}
++
++QString PhotoFlash::finish()
++{
++    if (!m_fd.isValid()) {
++        return {};
++    }
++    QStringList errors;
++    const int fd = m_fd.get();
++    int faults = 0;
++    if (int error = getControl(fd, V4L2_CID_FLASH_FAULT, faults)) {
++        errors << flashError("read fault", error);
++    } else if (faults) {
++        uint64_t now = 0;
++        // A pulse that ran for its programmed duration ends on the hardware timer.
++        if (m_earliestExpiryNs && !monotonicTime(now) && now >= m_earliestExpiryNs) {
++            faults &= ~V4L2_FLASH_FAULT_TIMEOUT;
++        }
++        if (faults) {
++            errors << flashFault(faults);
++        }
++    }
++    if (m_earliestExpiryNs) {
++        if (int error = setControl(fd, V4L2_CID_FLASH_STROBE_STOP, 1)) {
++            errors << flashError("stop strobe", error);
++        }
++    }
++    if (int error = setAndRead(fd, V4L2_CID_FLASH_LED_MODE, V4L2_FLASH_LED_MODE_NONE)) {
++        errors << flashError("turn off", error);
++    }
++    m_fd.reset();
++    m_earliestExpiryNs = 0;
++    return errors.join(QLatin1Char('\n'));
++}
++
++PhotoFlash::~PhotoFlash()
++{
++    const auto error = finish();
++    if (!error.isEmpty()) {
++        qWarning() << error;
++    }
++}
+diff --git a/src/plasmacamera/photoflash.h b/src/plasmacamera/photoflash.h
+new file mode 100644
+index 0000000..708156d
+--- /dev/null
++++ b/src/plasmacamera/photoflash.h
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#pragma once
++
++#include <QString>
++#include <cstdint>
++#include <libcamera/base/unique_fd.h>
++
++namespace libcamera { class Camera; }
++
++class PhotoFlash
++{
++public:
++    struct Devices {
++        QString sensor;
++        QString led;
++
++        bool isValid() const { return !sensor.isEmpty() && !led.isEmpty(); }
++    };
++
++    struct Pulse {
++        // Command interval of the combined rear flash, in CLOCK_MONOTONIC nanoseconds.
++        uint64_t beginNs;
++        uint64_t endNs;
++    };
++
++    static Devices nodes(const libcamera::Camera &camera);
++    QString start(const QString &led, unsigned int requestedTimeoutUs, Pulse &pulse);
++    QString finish();
++    ~PhotoFlash();
++
++private:
++    libcamera::UniqueFD m_fd;
++    uint64_t m_earliestExpiryNs = 0;
++};
+diff --git a/src/plasmacamera/worker.cpp b/src/plasmacamera/worker.cpp
+index c5a7d5d..659fe21 100644
+--- a/src/plasmacamera/worker.cpp
++++ b/src/plasmacamera/worker.cpp
+@@ -6,12 +6,43 @@
+ #include <QDir>
+ #include <QFile>
+ #include <QFileInfo>
++#include <KLocalizedString>
+ #include <cerrno>
++#include <chrono>
+ #include <cstring>
+ #include <fcntl.h>
++#include <linux/v4l2-subdev.h>
+ #include <linux/videodev2.h>
+ #include <sys/ioctl.h>
+ 
++/* Read the running sensor mode. One frame period bounds both the longest
++ * integration (the IMX362 driver reserves ten lines) and the rolling readout. */
++static std::optional<uint64_t> framePeriodNs(const QString &sensor)
++{
++    libcamera::UniqueFD fd(::open(QFile::encodeName(sensor).constData(), O_RDONLY | O_CLOEXEC));
++    v4l2_subdev_format format{};
++    format.which = V4L2_SUBDEV_FORMAT_ACTIVE;
++    v4l2_control hblank{}, vblank{};
++    hblank.id = V4L2_CID_HBLANK;
++    vblank.id = V4L2_CID_VBLANK;
++    v4l2_ext_control pixelRate{};
++    pixelRate.id = V4L2_CID_PIXEL_RATE;
++    v4l2_ext_controls controls{};
++    controls.count = 1;
++    controls.controls = &pixelRate;
++    if (!fd.isValid() || ioctl(fd.get(), static_cast<int>(VIDIOC_SUBDEV_G_FMT), &format) < 0
++        || ioctl(fd.get(), static_cast<int>(VIDIOC_G_CTRL), &hblank) < 0
++        || ioctl(fd.get(), static_cast<int>(VIDIOC_G_CTRL), &vblank) < 0
++        || ioctl(fd.get(), static_cast<int>(VIDIOC_G_EXT_CTRLS), &controls) < 0
++        || !format.format.width || !format.format.height || hblank.value < 0 || vblank.value < 0 || pixelRate.value64 <= 0) {
++        return std::nullopt;
++    }
++    const double lineClocks = double(format.format.width) + hblank.value;
++    const double frameLines = double(format.format.height) + vblank.value;
++    return std::chrono::ceil<std::chrono::nanoseconds>(
++        std::chrono::duration<double>(lineClocks * frameLines / double(pixelRate.value64))).count();
++}
++
+ static QString stabilizerNode(const libcamera::Camera &camera)
+ {
+     if (camera.properties().get(libcamera::properties::Model) != "imx362") {
+@@ -53,6 +84,11 @@ void Worker::init()
+     m_framePollTimer = new QTimer(this);
+     m_framePollTimer->setInterval(1000 / 60); // manually set 60 fps
+     connect(m_framePollTimer, &QTimer::timeout, this, &Worker::requestNextFrame);
++    m_photoDeadline = new QTimer(this);
++    m_photoDeadline->setSingleShot(true);
++    connect(m_photoDeadline, &QTimer::timeout, this, [this] {
++        cancelFlash(i18n("No complete exposure arrived during the flash."));
++    });
+ 
+     setState(State::Ready);
+ }
+@@ -114,12 +150,60 @@ void Worker::unsetCamera()
+     }
+ }
+ 
+-void Worker::capture()
++void Worker::capture(const QString &cameraId, bool withFlash)
+ {
++    if (m_state != State::Running || m_mode != CaptureMode::ViewFinder
++        || !m_camera || QString::fromStdString(m_camera->id()) != cameraId) {
++        Q_EMIT captureFailed(cameraId, i18n("The camera is not ready."));
++        return;
++    }
+     m_stillCaptureFrames.clear();
++    if (withFlash) {
++        if (!m_flashDevices.isValid()) {
++            Q_EMIT captureFailed(cameraId, i18n("The selected camera has no photo flash."));
++            return;
++        }
++        // The hardware cuts power at 250 ms even if delivery of a frame stops.
++        constexpr unsigned int timeoutUs = 250000;
++        const auto period = framePeriodNs(m_flashDevices.sensor);
++        if (!period || *period >= uint64_t(timeoutUs) * 1000 / 2) {
++            Q_EMIT captureFailed(cameraId, i18n("The current sensor timing cannot be used for flash."));
++            return;
++        }
++        PhotoFlash::Pulse pulse{};
++        const QString error = m_photoFlash.start(m_flashDevices.led, timeoutUs, pulse);
++        if (!error.isEmpty()) {
++            Q_EMIT captureFailed(cameraId, error);
++            return;
++        }
++        // CAMSS timestamps the end of RAW DMA. Allow a full readout and
++        // a full exposure after the shared strobe has been enabled.
++        pulse.beginNs += 2 * *period;
++        m_photoWindow = pulse;
++        if (pulse.beginNs >= pulse.endNs) {
++            cancelFlash(i18n("The flash interval was too short for the current exposure."));
++            return;
++        }
++        // A processed image can arrive after the hardware timer has expired.
++        // Allow the software ISP to deliver it, but do not leave the UI busy
++        // indefinitely if the camera stops producing frames.
++        m_photoDeadline->start(2000);
++    }
+     setMode(CaptureMode::StillImage);
+ }
+ 
++void Worker::cancelFlash(const QString &reason)
++{
++    m_photoDeadline->stop();
++    m_photoWindow.reset();
++    const QString cleanup = m_photoFlash.finish();
++    if (m_mode == CaptureMode::StillImage) {
++        setMode(CaptureMode::ViewFinder);
++    }
++    Q_EMIT captureFailed(QString::fromStdString(m_camera->id()),
++                         cleanup.isEmpty() ? reason : reason + QLatin1Char('\n') + cleanup);
++}
++
+ void Worker::startAutoFocus()
+ {
+     if (m_state == State::Running) {
+@@ -275,10 +359,29 @@ void Worker::requestComplete(libcamera::Request *request)
+ void Worker::processRequestDataAndEmit()
+ {
+     // Populates m_image
+-    processRequestData();
++    auto *request = processRequestData();
++    if (!request) {
++        return;
++    }
+ 
+-    // Implement photo capture
+-    if (m_mode == CaptureMode::StillImage) {
++    if (m_photoWindow) {
++        const auto &frame = request->buffers().at(m_stream)->metadata();
++        if (frame.timestamp >= m_photoWindow->endNs) {
++            cancelFlash(i18n("No complete exposure arrived during the flash."));
++        } else if (frame.status == libcamera::FrameMetadata::FrameSuccess && frame.timestamp >= m_photoWindow->beginNs) {
++            m_photoDeadline->stop();
++            m_photoWindow.reset();
++            const QString error = m_photoFlash.finish();
++            setMode(CaptureMode::ViewFinder);
++            if (error.isEmpty()) {
++                // The JPEG writer takes the queue head. Never include an older preview frame.
++                m_stillCaptureFrames.enqueue(m_image.copy());
++                Q_EMIT stillCaptureFrames(m_stillCaptureFrames);
++            } else {
++                Q_EMIT captureFailed(QString::fromStdString(m_camera->id()), error);
++            }
++        }
++    } else if (m_mode == CaptureMode::StillImage) {
+         const QMutexLocker lock(&m_stillCaptureFramesMutex);
+ 
+         if (m_stillCaptureFrames.length() >= 5) {
+@@ -320,20 +423,20 @@ void Worker::readAutoFocusState(libcamera::Request &request)
+     }
+ }
+ 
+-void Worker::processRequestData()
++libcamera::Request *Worker::processRequestData()
+ {
+     libcamera::Request *request;
+     {
+         // Obtain a finished request from the queue
+         const QMutexLocker lock(&m_doneMutex);
+         if (m_doneQueue.isEmpty()) {
+-            return;
++            return nullptr;
+         }
+         request = m_doneQueue.dequeue();
+     }
+ 
+     if (!request->buffers().count(m_stream)) {
+-        return;
++        return nullptr;
+     }
+ 
+     readAutoFocusState(*request);
+@@ -342,7 +445,9 @@ void Worker::processRequestData()
+ 
+     // Load frame into m_image
+     size_t size = buffer->metadata().planes()[0].bytesused;
+-    if (getNativeFormats().contains(m_format)) {
++    if (buffer->metadata().status != libcamera::FrameMetadata::FrameSuccess || !size) {
++        m_image = {};
++    } else if (getNativeFormats().contains(m_format)) {
+         m_image = QImage(image->data(0).data(), m_size.width(), m_size.height(), static_cast<qsizetype>(size) / m_size.height(), NATIVE_FORMATS[m_format]);
+     } else {
+         m_converter.convert(image, size, &m_image);
+@@ -353,6 +458,7 @@ void Worker::processRequestData()
+         const QMutexLocker lock(&m_freeMutex);
+         m_freeQueue.enqueue(request);
+     }
++    return m_image.isNull() ? nullptr : request;
+ }
+ 
+ void Worker::startViewFinder()
+@@ -395,10 +501,16 @@ void Worker::startViewFinder()
+     m_framePollTimer->start();
+     m_stabilizerNode = stabilizerNode(*m_camera);
+     Q_EMIT stabilizationChanged(QString::fromStdString(m_camera->id()), !m_stabilizerNode.isEmpty(), false);
++    m_flashDevices = PhotoFlash::nodes(*m_camera);
++    Q_EMIT photoFlashAvailable(QString::fromStdString(m_camera->id()), m_flashDevices.isValid());
+ }
+ 
+ void Worker::stopViewFinder()
+ {
++    if (m_photoWindow) {
++        cancelFlash(i18n("The camera stopped before the flash photo was captured."));
++    }
++    m_flashDevices = {};
+     if (m_stabilizer.isValid()) {
+         setStabilization(QString::fromStdString(m_camera->id()), false);
+     }
+diff --git a/src/plasmacamera/worker.h b/src/plasmacamera/worker.h
+index e08a2c1..d8ad964 100644
+--- a/src/plasmacamera/worker.h
++++ b/src/plasmacamera/worker.h
+@@ -13,12 +13,14 @@
+ #include <QCameraFormat>
+ 
+ #include <memory>
++#include <optional>
+ #include <libcamera/base/unique_fd.h>
+ #include <libcamera/libcamera.h>
+ #include <libcamera/framebuffer.h>
+ 
+ #include "converter.h"
+ #include "image.h"
++#include "photoflash.h"
+ #include "settings.h"
+ 
+ // needed to pass shared_ptr via signals
+@@ -46,6 +48,8 @@ Q_SIGNALS:
+     void cameraFormatChanged();
+     void autoFocusFinished(const QString &cameraId, bool focused);
+     void stabilizationChanged(const QString &cameraId, bool available, bool enabled);
++    void photoFlashAvailable(const QString &cameraId, bool available);
++    void captureFailed(const QString &cameraId, const QString &reason);
+     void supportedFeaturesChanged();
+ 
+     // Get frames
+@@ -70,7 +74,7 @@ public Q_SLOTS:
+     void unsetCamera();
+ 
+     // Photo capture
+-    void capture();
++    void capture(const QString &cameraId, bool withFlash);
+     void startAutoFocus();
+     void setStabilization(const QString &cameraId, bool enabled);
+ 
+@@ -127,7 +131,8 @@ private:
+     int createRequests();
+ 
+     void requestComplete(libcamera::Request *request);
+-    void processRequestData(); // convert buffers to QImage stored at m_image
++    libcamera::Request *processRequestData(); // convert the completed buffer into m_image
++    void cancelFlash(const QString &reason);
+ 
+     bool m_error = false;
+     QString m_errorString;
+@@ -139,6 +144,10 @@ private:
+     FocusScan m_focusScan = FocusScan::Idle;
+     QString m_stabilizerNode;
+     libcamera::UniqueFD m_stabilizer;
++    PhotoFlash m_photoFlash;
++    PhotoFlash::Devices m_flashDevices;
++    std::optional<PhotoFlash::Pulse> m_photoWindow;
++    QTimer *m_photoDeadline = nullptr;
+     CaptureMode m_mode = CaptureMode::None;
+ 
+     // internals
+diff --git a/src/plasmacameramanager.cpp b/src/plasmacameramanager.cpp
+index 7aac316..404e34a 100644
+--- a/src/plasmacameramanager.cpp
++++ b/src/plasmacameramanager.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <QSize>
++#include <QSaveFile>
+ 
+ #include "camerasettings.h"
+ #include "plasmacamera/path.h"
+@@ -192,14 +193,12 @@ void PlasmaCameraManager::stopRecordingVideo()
+ 
+ int PlasmaCameraManager::captureImage()
+ {
+-    m_imageCaptureFileName.clear();
+-    return captureImageInternal();
++    return captureImageInternal({});
+ }
+ 
+ int PlasmaCameraManager::captureImageToFile(const QString &location)
+ {
+-    m_imageCaptureFileName = location;
+-    return captureImageInternal();
++    return captureImageInternal(location);
+ }
+ 
+ void PlasmaCameraManager::setReadyForCapture(const bool ready)
+@@ -545,7 +544,7 @@ void PlasmaCameraManager::processCaptureImage(const QQueue<QImage> &frames)
+     }
+     const QString fileName = PlasmaLibcameraUtils::generateFileName(
+         m_imageCaptureFileName, QLatin1String("jpg"), m_filenamePattern, m_outputPath);
+-    QFile file(fileName);
++    QSaveFile file(fileName);
+ 
+     QImage image = frames.head();
+ 
+@@ -563,12 +562,12 @@ void PlasmaCameraManager::processCaptureImage(const QQueue<QImage> &frames)
+ 
+     // TODO: set format and quality
+     qDebug() << "saving image to " << fileName;
+-    const bool res = image.save(&file, "JPEG", 50);
+-    if (!res) {
++    if (!file.open(QIODevice::WriteOnly) || !image.save(&file, "JPEG", 50) || !file.commit()) {
+         setError(
+-            0,
++            m_imageCaptureNum,
+             ResourceError,
+             QString::fromStdString("Could not save to file: %1").arg(fileName));
++        return;
+     }
+ 
+     // Write EXIF data
+@@ -676,11 +675,11 @@ void PlasmaCameraManager::updateFromOrientationSensor()
+     }
+ }
+ 
+-int PlasmaCameraManager::captureImageInternal()
++int PlasmaCameraManager::captureImageInternal(const QString &location)
+ {
+     const int newImageCaptureId = m_imageCaptureNum + 1;
+ 
+-    if (!isReadyForCapture()) {
++    if (!isReadyForCapture() || !m_plasmaCamera->captureImage()) {
+         setError(
+             newImageCaptureId,
+             NotReadyError,
+@@ -689,7 +688,7 @@ int PlasmaCameraManager::captureImageInternal()
+     }
+ 
+     m_imageCaptureNum = newImageCaptureId;
+-    m_plasmaCamera->captureImage();
++    m_imageCaptureFileName = location;
+ 
+     return newImageCaptureId;
+ }
+diff --git a/src/plasmacameramanager.h b/src/plasmacameramanager.h
+index 2c27541..144e80a 100644
+--- a/src/plasmacameramanager.h
++++ b/src/plasmacameramanager.h
+@@ -234,7 +234,7 @@ private:
+ 
+     void setAudioRecordingEnabledInternal(bool enabled);
+ 
+-    int captureImageInternal();
++    int captureImageInternal(const QString &location);
+ 
+     /*!
+      * The amount of degrees to rotate the final output frame by.

@@ -1,0 +1,78 @@
+Subject: [PATCH] simple: prefer binned IMX362 viewfinder and shorten contrast scan
+
+For a viewfinder request choose the maximum processed size of the binned
+configuration when the driver exposes it. Using the raw width as the
+processed width would exceed the debayer's border allowance and select
+the full sensor again. Explicit larger output requests still select full
+resolution. Plasma Camera 2.1.1 saves frames from its viewfinder stream.
+
+During coarse focus scanning, two consecutive settled scores more than
+25% below the peak justify proceeding directly to local refinement.
+Retain timestamp filtering, the two-frame settle and final peak check.
+
+diff --git a/src/libcamera/pipeline/simple/autofocus.cpp b/src/libcamera/pipeline/simple/autofocus.cpp
+index 21a874a..2248e6e 100644
+--- a/src/libcamera/pipeline/simple/autofocus.cpp
++++ b/src/libcamera/pipeline/simple/autofocus.cpp
+@@ -59,6 +59,7 @@ void SimpleAutofocus::request(const ControlList &ctrls)
+ 
+ 	state_ = controls::AfStateScanning;
+ 	scan_ = Scan::Coarse;
++	belowPeak_ = 0;
+ 	bestScore_ = -1;
+ 	lowestScore_ = std::numeric_limits<int32_t>::max();
+ 	step_ = coarseStep_;
+@@ -142,7 +143,17 @@ void SimpleAutofocus::sample(int32_t score)
+ 		bestPosition_ = position_;
+ 	}
+ 
+-	if (position_ < limit_) {
++	/* Once two settled coarse samples have fallen past the contrast
++	 * threshold, refine that peak without continuing all the way to macro.
++	 */
++	if (scan_ == Scan::Coarse) {
++		if (bestScore_ - score >= 2 && int64_t(score) * 4 < int64_t(bestScore_) * 3)
++			++belowPeak_;
++		else
++			belowPeak_ = 0;
++	}
++
++	if (position_ < limit_ && (scan_ != Scan::Coarse || belowPeak_ < 2)) {
+ 		move(std::min<int64_t>(int64_t(position_) + step_, limit_));
+ 		return;
+ 	}
+diff --git a/src/libcamera/pipeline/simple/autofocus.h b/src/libcamera/pipeline/simple/autofocus.h
+index da3c49f..e7e2519 100644
+--- a/src/libcamera/pipeline/simple/autofocus.h
++++ b/src/libcamera/pipeline/simple/autofocus.h
+@@ -46,6 +46,7 @@ private:
+ 	int32_t limit_ = 0;
+ 	uint64_t ignoreThrough_ = 0;
+ 	unsigned int settlingFrames_ = 0;
++	unsigned int belowPeak_ = 0;
+ 	unsigned int missingScores_ = 0;
+ };
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 41b5f54..8b7dcb7 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1526,6 +1526,18 @@ SimplePipelineHandler::generateConfiguration(Camera *camera, Span<const StreamRo
+ 		cfg.pixelFormat = formats.begin()->first;
+ 		cfg.size = formats.begin()->second[0].max;
+ 
++		/* Use the full field of view of the binned IMX362 mode, including
++		 * the debayer's border allowance in the processed size.
++		 */
++		if (role == StreamRole::Viewfinder && data->sensor_->model() == "imx362") {
++			for (const auto *pipe : data->formats_.at(cfg.pixelFormat)) {
++				if (pipe->sensorSize == Size(2016, 1512)) {
++					cfg.size = pipe->outputSizes.max;
++					break;
++				}
++			}
++		}
++
+ 		config->addConfiguration(cfg);
+ 	}
+ 

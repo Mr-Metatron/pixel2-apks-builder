@@ -1,0 +1,1064 @@
+Subject: [PATCH] apps: meter and diagnose the Walleye IMX362 phase stream
+
+Capture the validated VC1 Y10 route and restore the previous media graph
+and sensor controls on exit. Meter settled pairs at fixed settings, report
+temporal noise and phase-window contrast, and retain calibration-free raw
+replay. Register the padded monochrome bus format in the subdevice table.
+
+diff --git a/src/apps/imx362-pdaf/main.cpp b/src/apps/imx362-pdaf/main.cpp
+new file mode 100644
+index 0000000..4b522bf
+--- /dev/null
++++ b/src/apps/imx362-pdaf/main.cpp
+@@ -0,0 +1,572 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "pdaf.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <charconv>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <set>
++#include <string_view>
++
++#include <linux/media-bus-format.h>
++#include <linux/videodev2.h>
++
++#include <libcamera/base/event_dispatcher.h>
++#include <libcamera/base/thread.h>
++#include <libcamera/base/timer.h>
++
++#include "libcamera/internal/camera_lens.h"
++#include "libcamera/internal/device_enumerator.h"
++#include "libcamera/internal/dma_buf_allocator.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++#include "libcamera/internal/media_device.h"
++#include "libcamera/internal/v4l2_subdevice.h"
++#include "libcamera/internal/v4l2_videodevice.h"
++
++using namespace libcamera;
++using namespace std::chrono_literals;
++
++namespace {
++
++const Size pdSize{ imx362::width, imx362::height };
++constexpr size_t frameBytes = imx362::stride * imx362::height;
++
++/* Stock res6: 520 MHz VT, 5400 clocks/line, 1512 image lines, minimum
++ * 7.5 fps. Leave the driver's ten-line integration margin at that limit.
++ */
++constexpr int imageLines = 1512, minBlank = 88, maxExposure = 12829, maxGain = 448;
++struct Exposure {
++	int lines, gain;
++	int vblank() const { return std::max(minBlank, lines + 10 - imageLines); }
++	bool atLimit() const { return lines == maxExposure && gain == maxGain; }
++};
++constexpr std::array<Exposure, 5> exposureSteps{ {
++	{ 963, 0 }, { 3852, 0 }, { maxExposure, 0 }, { maxExposure, 384 }, { maxExposure, maxGain },
++} };
++constexpr std::array<uint32_t, 3> sensorIds{
++	V4L2_CID_VBLANK, V4L2_CID_EXPOSURE, V4L2_CID_ANALOGUE_GAIN
++};
++
++std::vector<uint8_t> readFile(const std::string &name, size_t size)
++{
++	std::ifstream file(name, std::ios::binary);
++	std::vector<uint8_t> bytes(size);
++	if (!file.read(reinterpret_cast<char *>(bytes.data()), size) || file.peek() != EOF)
++		return {};
++	return bytes;
++}
++
++int saveFrame(const char *name, Span<const uint8_t> bytes)
++{
++	FILE *file = fopen(name, "wbx");
++	if (!file)
++		return -errno;
++	bool written = fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size();
++	if (fclose(file) == 0 && written)
++		return 0;
++	std::remove(name);
++	return -EIO;
++}
++
++/* Switch the idle rear graph to VC1. Save active formats and mutable links
++ * so an ordinary VC0 client can reuse the pipeline after the trial.
++ */
++class Graph
++{
++public:
++	int configure(MediaDevice &media, MediaEntity *sensor)
++	{
++		std::array<MediaEntity *, 5> nodes = { sensor, media.getEntityByName("msm_csiphy0"),
++			media.getEntityByName("msm_csid0"), media.getEntityByName("msm_ispif0"),
++			media.getEntityByName("msm_vfe0_rdi0") };
++		if (std::find(nodes.begin(), nodes.end(), nullptr) != nodes.end())
++			return -ENODEV;
++
++		const std::array<unsigned int, 4> sources = { 0, 1, 2, 1 };
++		std::vector<MediaLink *> route;
++		for (unsigned int i = 0; i < sources.size(); ++i) {
++			auto *link = media.link(nodes[i], sources[i], nodes[i + 1], 0);
++			if (!link)
++				return -ENOLINK;
++			route.push_back(link);
++		}
++
++		std::set<MediaLink *> conflicts;
++		for (auto *node : nodes)
++			for (const auto *pad : node->pads())
++				for (auto *link : pad->links())
++					if ((link->flags() & MEDIA_LNK_FL_ENABLED) &&
++					    !(link->flags() & MEDIA_LNK_FL_IMMUTABLE) &&
++					    std::find(route.begin(), route.end(), link) == route.end())
++						conflicts.insert(link);
++		for (auto *link : conflicts) {
++			int ret = link->setEnabled(false);
++			if (ret)
++				return ret;
++			disabled_.push_back(link);
++		}
++		for (auto *link : route) {
++			if (link->flags() & MEDIA_LNK_FL_ENABLED)
++				continue;
++			int ret = link->setEnabled(true);
++			if (ret)
++				return ret;
++			enabled_.push_back(link);
++		}
++
++		for (unsigned int i = 0; i < nodes.size(); ++i) {
++			auto &sd = devices_.emplace_back(std::make_unique<V4L2Subdevice>(nodes[i]));
++			int ret = sd->open();
++			if (ret)
++				return ret;
++			if (i == 0) {
++				auto saved = sd->getControls(sensorIds);
++				if (saved.size() != sensorIds.size())
++					return -EIO;
++				sensorControls_ = std::move(saved);
++			}
++			for (const auto *pad : nodes[i]->pads()) {
++				V4L2SubdeviceFormat old{};
++				ret = sd->getFormat(pad->index(), &old);
++				if (ret)
++					return ret;
++				saved_.push_back({ sd.get(), pad->index(), old });
++			}
++			const bool pd = i > 2;
++			uint32_t code = pd ? MEDIA_BUS_FMT_Y10_2X8_PADHI_LE : MEDIA_BUS_FMT_SBGGR10_1X10;
++			V4L2SubdeviceFormat fmt{ code,
++						  pd ? pdSize : Size(2016, 1512), {} };
++			ret = set(*sd, 0, fmt);
++			if (!ret && i == 2)
++				ret = set(*sd, 2, { MEDIA_BUS_FMT_Y10_2X8_PADHI_LE, pdSize, {} });
++			if (ret)
++				return ret;
++		}
++		return 0;
++	}
++
++	int restore()
++	{
++		int error = 0;
++		for (auto &s : saved_)
++			if (s.sd->setFormat(s.pad, &s.format))
++				error = -EIO;
++		if (!sensorControls_.empty()) {
++			int ret = writeControls(sensorControls_.get(V4L2_CID_VBLANK).get<int32_t>(),
++						sensorControls_.get(V4L2_CID_EXPOSURE).get<int32_t>(),
++						sensorControls_.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>());
++			if (ret)
++				error = ret;
++		}
++		for (auto i = enabled_.rbegin(); i != enabled_.rend(); ++i)
++			if ((*i)->setEnabled(false))
++				error = -EIO;
++		for (auto *link : disabled_)
++			if (link->setEnabled(true))
++				error = -EIO;
++		return error;
++	}
++
++	int setExposure(const Exposure &e)
++	{
++		return writeControls(e.vblank(), e.lines, e.gain);
++	}
++
++private:
++	int writeControls(int blank, int lines, int gain)
++	{
++		auto &sensor = *devices_.front();
++		/* VBLANK changes the kernel's exposure range. Commit it separately. */
++		ControlList timing(sensor.controls());
++		timing.set(V4L2_CID_VBLANK, blank);
++		int ret = sensor.setControls(&timing);
++		if (ret)
++			return ret < 0 ? ret : -EIO;
++		ControlList light(sensor.controls());
++		light.set(V4L2_CID_EXPOSURE, lines);
++		light.set(V4L2_CID_ANALOGUE_GAIN, gain);
++		ret = sensor.setControls(&light);
++		if (ret)
++			return ret < 0 ? ret : -EIO;
++		auto readback = sensor.getControls(sensorIds);
++		if (readback.size() != sensorIds.size() ||
++		    readback.get(V4L2_CID_VBLANK).get<int32_t>() != blank ||
++		    readback.get(V4L2_CID_EXPOSURE).get<int32_t>() != lines ||
++		    readback.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>() != gain) {
++			std::cerr << "Sensor exposure control readback mismatch\n";
++			return -EIO;
++		}
++		return 0;
++	}
++
++	static int set(V4L2Subdevice &sd, unsigned int pad, V4L2SubdeviceFormat wanted)
++	{
++		auto fmt = wanted;
++		int ret = sd.setFormat(pad, &fmt);
++		if (ret)
++			return ret;
++		return fmt.code == wanted.code && fmt.size == wanted.size ? 0 : -EINVAL;
++	}
++
++	struct Saved { V4L2Subdevice *sd; unsigned int pad; V4L2SubdeviceFormat format; };
++	std::vector<std::unique_ptr<V4L2Subdevice>> devices_;
++	std::vector<Saved> saved_;
++	ControlList sensorControls_;
++	std::vector<MediaLink *> enabled_, disabled_;
++};
++
++class Capture
++{
++public:
++	explicit Capture(MediaEntity *entity) : video_(entity) {}
++
++	int start()
++	{
++		int ret = video_.open();
++		if (ret)
++			return ret;
++		V4L2DeviceFormat fmt{};
++		fmt.fourcc = V4L2PixelFormat(V4L2_PIX_FMT_Y10);
++		fmt.size = pdSize;
++		ret = video_.setFormat(&fmt);
++		if (ret)
++			return ret;
++		if (fmt.fourcc != V4L2PixelFormat(V4L2_PIX_FMT_Y10) || fmt.size != pdSize ||
++		    fmt.planesCount != 1 || fmt.planes[0].bpl != imx362::stride)
++			return -EINVAL;
++		ret = video_.allocateBuffers(4, &buffers_);
++		if (ret < 0)
++			return ret;
++		video_.bufferReady.connect(this, [this](FrameBuffer *b) { ready_.push_back(b); });
++		for (const auto &b : buffers_) {
++			ret = video_.queueBuffer(b.get());
++			if (ret)
++				return ret;
++		}
++		return video_.streamOn();
++	}
++
++	int stop() { return video_.streamOff(); }
++
++	int settled(std::vector<uint8_t> &previous, std::vector<uint8_t> &bytes)
++	{
++		const uint64_t after = std::chrono::duration_cast<std::chrono::nanoseconds>(
++			utils::clock::now().time_since_epoch()).count();
++		Timer deadline;
++		deadline.start(3s);
++		unsigned int fresh = 0;
++		while (deadline.isRunning()) {
++			if (ready_.empty()) {
++				Thread::current()->eventDispatcher()->processEvents();
++				continue;
++			}
++			auto *b = ready_.front();
++			ready_.pop_front();
++			if (b->metadata().status != FrameMetadata::FrameSuccess)
++				return -EIO;
++			/* The Walleye exposure and gain delay is two frames. */
++			if (b->metadata().timestamp > after && ++fresh >= 3) {
++				MappedFrameBuffer map(b, MappedFrameBuffer::MapFlag::Read);
++				if (!map.isValid())
++					return map.error();
++				if (b->metadata().planes()[0].bytesused != frameBytes ||
++				    map.planes()[0].size() < frameBytes)
++					return -EMSGSIZE;
++				DmaSyncer sync(b->planes()[0].fd, DmaSyncer::SyncType::Read);
++				auto p = map.planes()[0].first(frameBytes);
++				auto &dest = fresh == 3 ? previous : bytes;
++				dest.assign(p.begin(), p.end());
++			}
++			int ret = video_.queueBuffer(b);
++			if (ret || fresh == 4)
++				return ret;
++		}
++		return -ETIMEDOUT;
++	}
++
++private:
++	std::vector<std::unique_ptr<FrameBuffer>> buffers_;
++	std::deque<FrameBuffer *> ready_;
++	V4L2VideoDevice video_;
++};
++
++void report(const imx362::Analysis &a, const imx362::Calibration *cal,
++	    std::optional<Exposure> exposure)
++{
++	std::cout << std::fixed << std::setprecision(3);
++	if (exposure) {
++		const auto &e = *exposure;
++		std::cout << "exposure_lines=" << e.lines << " exposure_us=" << e.lines * (5400.0 / 520)
++			  << " gain_code=" << e.gain << " gain_x=" << 512.0 / (512 - e.gain)
++			  << " vblank_lines=" << e.vblank() << ' ';
++	}
++	std::cout << "mean=" << a.mean << " rms_left=" << a.rmsLeft << " rms_right=" << a.rmsRight;
++	if (a.temporalNoise)
++		std::cout << " temporal_noise=" << *a.temporalNoise;
++	if (a.temporalNoise && *a.temporalNoise > 0 && a.mean > imx362::blackLevel)
++		std::cout << " snr_db=" << 20 * std::log10((a.mean - imx362::blackLevel) / *a.temporalNoise);
++	else
++		std::cout << " snr_db=unavailable";
++	if (a.mean < imx362::dimMean && exposure && exposure->atLimit())
++		std::cout << " light=DARK_AT_LIMIT (check for a covered lens or insufficient light)";
++	else
++		std::cout << " light=" << (a.mean < imx362::dimMean ? "dim" : "above_threshold");
++	if (!a.textured())
++		std::cout << " phase=unavailable_low_contrast";
++	else if (!cal)
++		std::cout << " phase=requires_calibration";
++	else if (!a.phase)
++		std::cout << " phase=no_reliable_match";
++	else
++		std::cout << " phase=" << a.phase->phase << " correlation=" << a.phase->correlation
++			  << " defocus=" << a.phase->defocus;
++	std::cout << '\n';
++}
++
++/* Keep the selected setting for subsequent lens positions in a focus run. */
++int meteredFrame(Graph &graph, Capture &capture, std::optional<Exposure> &fixed,
++		 const imx362::Calibration *cal, std::vector<uint8_t> &bytes,
++		 imx362::Analysis &analysis)
++{
++	std::vector<uint8_t> previous;
++	for (const Exposure &step : exposureSteps) {
++		Exposure e = fixed.value_or(step);
++		int ret = graph.setExposure(e);
++		if (ret)
++			return ret;
++		ret = capture.settled(previous, bytes);
++		if (ret)
++			return ret;
++		auto measured = imx362::analyse(bytes, cal, previous);
++		if (!measured)
++			return -EBADMSG;
++		report(*measured, cal, e);
++		if (fixed || measured->mean >= imx362::dimMean || e.atLimit()) {
++			fixed = e;
++			analysis = *measured;
++			return 0;
++		}
++	}
++	return -ERANGE;
++}
++
++int focus(Graph &graph, Capture &capture, CameraLens &lens, const imx362::Calibration &cal,
++	  std::optional<Exposure> exposure)
++{
++	/* Measure the sign and units on this module before extrapolating. */
++	std::optional<int> previous;
++	int position = 448;
++	double previousPhase = 0;
++	unsigned int confirmations = 0;
++	std::vector<uint8_t> bytes;
++	for (unsigned int attempt = 0; attempt < 6; ++attempt) {
++		if (!confirmations) {
++			int ret = lens.setFocusPosition(position);
++			if (ret)
++				return ret;
++		}
++		std::cout << "position=" << position << '\n';
++		imx362::Analysis analysis;
++		int ret = meteredFrame(graph, capture, exposure, &cal, bytes, analysis);
++		if (ret)
++			return ret;
++		const auto &m = analysis.phase;
++		if (!m)
++			return -ENODATA;
++		if (std::abs(m->phase) <= 0.25) {
++			if (++confirmations == 2)
++				return 0;
++			continue;
++		}
++		confirmations = 0;
++		int next = 576;
++		if (previous) {
++			if (std::abs(m->phase - previousPhase) < 0.25)
++				return -ENODATA;
++			auto target = imx362::focusTarget(*previous, previousPhase * cal.centreCoefficient(),
++							  position, m->defocus);
++			if (!target || *target == position)
++				return -ERANGE;
++			next = *target;
++		}
++		previous = position;
++		previousPhase = m->phase;
++		position = next;
++	}
++	return -EAGAIN;
++}
++
++int live(const char *output, std::optional<int> position, const imx362::Calibration *cal,
++	 std::optional<Exposure> exposure)
++{
++	auto enumerator = DeviceEnumerator::create();
++	if (!enumerator)
++		return -ENODEV;
++	int ret = enumerator->enumerate();
++	if (ret)
++		return ret;
++	auto media = enumerator->search(DeviceMatch("qcom-camss"));
++	if (!media || !media->acquire())
++		return -ENODEV;
++	utils::ScopeExitActions release;
++	release += [&] { media->release(); };
++	if (!media->lock())
++		return -EBUSY;
++	auto *sensor = media->getEntityByName(std::regex("imx362 [0-9]+-001a"));
++	auto *video = media->getEntityByName("msm_vfe0_video0");
++	if (!sensor || !video)
++		return -ENODEV;
++
++	std::unique_ptr<CameraLens> lens;
++	if (position || cal) {
++		for (auto *e : sensor->ancillaryEntities()) {
++			if (e->function() == MEDIA_ENT_F_LENS) {
++				lens = std::make_unique<CameraLens>(e);
++				break;
++			}
++		}
++		if (!lens)
++			return -ENODEV;
++		ret = lens->init();
++		if (ret)
++			return ret;
++		const auto &range = lens->controls().at(V4L2_CID_FOCUS_ABSOLUTE);
++		if (range.min().get<int32_t>() != 0 || range.max().get<int32_t>() != 1023)
++			return -ERANGE;
++	}
++
++	Graph graph;
++	ret = graph.configure(*media, sensor);
++	if (!ret) {
++		Capture capture(video);
++		ret = capture.start();
++		if (!ret) {
++			if (cal) {
++				ret = focus(graph, capture, *lens, *cal, exposure);
++			} else {
++				std::vector<uint8_t> bytes;
++				imx362::Analysis analysis;
++				if (position)
++					ret = lens->setFocusPosition(*position);
++				if (!ret)
++					ret = meteredFrame(graph, capture, exposure, nullptr, bytes, analysis);
++				if (!ret)
++					ret = saveFrame(output, bytes);
++			}
++			int stopped = capture.stop();
++			if (!ret)
++				ret = stopped;
++		}
++	}
++	int restored = graph.restore();
++	return restored ? restored : ret;
++}
++
++void usage()
++{
++	std::cerr << "imx362-pdaf capture NEW_FILE [POSITION] [--exposure LINES] [--gain CODE]\n"
++		     "imx362-pdaf focus CELLS [--exposure LINES] [--gain CODE]\n"
++		     "imx362-pdaf replay [CELLS] FRAME\n"
++		     "Live default: meter and boost. Manual: 1..12829 lines, gain code 0..448; "
++		     "omitted control defaults to 963 lines or 0 (1x).\n";
++}
++
++std::optional<int> number(std::string_view text, int min, int max)
++{
++	int n;
++	const char *end = text.data() + text.size();
++	auto p = std::from_chars(text.data(), end, n);
++	if (p.ec != std::errc{} || p.ptr != end || n < min || n > max)
++		return {};
++	return n;
++}
++
++int run(int argc, char **argv)
++{
++	if (argc == 2 && std::string_view(argv[1]) == "--help") {
++		usage();
++		return 0;
++	}
++	if (argc < 3)
++		return -EINVAL;
++	const std::string_view command(argv[1]);
++	std::optional<int> position;
++	std::optional<Exposure> manual;
++	if (command == "capture" || command == "focus") {
++		int i = 3;
++		if (command == "capture" && i < argc && argv[i][0] != '-') {
++			position = number(argv[i++], 0, 1023);
++			if (!position)
++				return -EINVAL;
++		}
++		std::optional<int> lines, gain;
++		while (i + 1 < argc) {
++			const std::string_view option(argv[i++]);
++			const std::string_view value(argv[i++]);
++			if (option == "--exposure" && !lines)
++				lines = number(value, 1, maxExposure);
++			else if (option == "--gain" && !gain)
++				gain = number(value, 0, maxGain);
++			else
++				return -EINVAL;
++			if ((option == "--exposure" && !lines) || (option == "--gain" && !gain))
++				return -EINVAL;
++		}
++		if (i != argc)
++			return -EINVAL;
++		if (lines || gain)
++			manual = Exposure{ lines.value_or(exposureSteps.front().lines), gain.value_or(0) };
++		if (command == "capture")
++			return live(argv[2], position, nullptr, manual);
++	} else if (command != "replay" || argc > 4) {
++		return -EINVAL;
++	}
++
++	std::optional<imx362::Calibration> cal;
++	if (command == "focus" || argc == 4) {
++		const std::string cells = argv[2];
++		auto prefix = readFile(cells + "/module-prefix@0,0", 2);
++		auto af = readFile(cells + "/af-calibration@758,0", 8);
++		auto pd = readFile(cells + "/pdaf-calibration@764,0", 0x3e4);
++		if (prefix.empty() || af.empty() || pd.empty())
++			return -EIO;
++		cal = imx362::Calibration::read(prefix, af, pd);
++		if (!cal)
++			return -EBADMSG;
++		std::cout << "infinity=" << cal->infinity << " macro=" << cal->macro
++			  << " centre_K=" << cal->centreCoefficient() << '\n';
++	}
++	if (command == "focus")
++		return live(nullptr, {}, &*cal, manual);
++	const char *name = argv[argc - 1];
++	auto frame = readFile(name, frameBytes);
++	if (frame.empty()) {
++		std::cerr << "Expected a readable " << frameBytes << "-byte frame: " << name << '\n';
++		return -EIO;
++	}
++	const auto *calibration = cal ? &*cal : nullptr;
++	auto a = imx362::analyse(frame, calibration);
++	if (!a)
++		return -EBADMSG;
++	report(*a, calibration, {});
++	return a->textured() && (!cal || a->phase) ? 0 : -ENODATA;
++}
++
++} /* namespace */
++
++int main(int argc, char **argv)
++{
++	int ret = run(argc, argv);
++	if (ret == -EINVAL)
++		usage();
++	if (ret)
++		std::cerr << "imx362-pdaf: " << std::strerror(-ret) << '\n';
++	return ret ? EXIT_FAILURE : EXIT_SUCCESS;
++}
+diff --git a/src/apps/imx362-pdaf/meson.build b/src/apps/imx362-pdaf/meson.build
+new file mode 100644
+index 0000000..1eb0680
+--- /dev/null
++++ b/src/apps/imx362-pdaf/meson.build
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: CC0-1.0
++executable('imx362-pdaf', ['main.cpp', 'pdaf.cpp'],
++           dependencies : libcamera_private, install : true)
+diff --git a/src/apps/imx362-pdaf/pdaf.cpp b/src/apps/imx362-pdaf/pdaf.cpp
+new file mode 100644
+index 0000000..b05f365
+--- /dev/null
++++ b/src/apps/imx362-pdaf/pdaf.cpp
+@@ -0,0 +1,189 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "pdaf.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace imx362 {
++
++std::optional<Calibration> Calibration::read(libcamera::Span<const uint8_t> prefix,
++					     libcamera::Span<const uint8_t> af,
++					     libcamera::Span<const uint8_t> pd)
++{
++	if (prefix.size() != 2 || af.size() != 8 || pd.size() != 0x3e4)
++		return {};
++	const unsigned int flip = prefix[0] || prefix[1] ? 3 : 0;
++	auto word = [flip](auto cell, unsigned int n) {
++		return (cell[n ^ flip] << 8) | cell[(n + 1) ^ flip];
++	};
++	auto checksum = [&](auto cell, unsigned int end) {
++		uint16_t sum = 0;
++		for (unsigned int i = 0; i < end; ++i)
++			sum += cell[i ^ flip];
++		return sum == word(cell, end);
++	};
++	/* Offsets here are relative to the PD cell at module address 0x764. */
++	if (!checksum(af, 6) || !checksum(pd, 0x3e0) ||
++	    word(pd, 2) != 17 || word(pd, 4) != 13 ||
++	    word(pd, 0x37c) != 8 || word(pd, 0x37e) != 6)
++		return {};
++
++	Calibration cal;
++	cal.infinity = static_cast<int16_t>(word(af, 0)) / 16;
++	cal.macro = static_cast<int16_t>(word(af, 4)) / 16;
++	cal.q = word(pd, 0x37a);
++	if (cal.infinity == cal.macro || cal.q > 12)
++		return {};
++
++	/* The vendor fills all three destination grids in reverse order. */
++	for (unsigned int i = 0; i < cal.left.size(); ++i) {
++		unsigned int n = (cal.left.size() - 1 - i) * 2;
++		cal.left[i] = word(pd, 0x6 + n);
++		cal.right[i] = word(pd, 0x1c0 + n);
++	}
++	for (unsigned int i = 0; i < cal.dcc.size(); ++i)
++		cal.dcc[i] = word(pd, 0x380 + (cal.dcc.size() - 1 - i) * 2) >> 4;
++
++	if (!cal.centreCoefficient())
++		return {};
++	return cal;
++}
++
++double Calibration::centreCoefficient() const
++{
++	/* The stock 2PD routine averages the four surrounding knots, then
++	 * performs integer division by 2^Q. Use the centre of the frame.
++	 */
++	unsigned int sum = dcc[2 * 8 + 3] + dcc[2 * 8 + 4] +
++			   dcc[3 * 8 + 3] + dcc[3 * 8 + 4];
++	return (sum / 4) >> q;
++}
++
++namespace {
++
++/* The phase matcher compares nine rows of 112 pairs around the optical centre. */
++constexpr int radius = 8, halfWindow = 48, count = 2 * (halfWindow + radius);
++constexpr int firstRow = height / 2 - 32, lastRow = height / 2 + 32, step = 8;
++constexpr int firstPair = width / 4 - count / 2;
++
++unsigned int sample(libcamera::Span<const uint8_t> frame, size_t offset)
++{
++	return frame[offset] | frame[offset + 1] << 8;
++}
++
++double windowContrast(libcamera::Span<const uint8_t> frame, unsigned int channel)
++{
++	double variance = 0;
++	for (int y = firstRow; y <= lastRow; y += step) {
++		double sum = 0, squares = 0;
++		for (int x = firstPair; x < firstPair + count; ++x) {
++			double v = sample(frame, y * stride + 4 * x + 2 * channel);
++			sum += v;
++			squares += v * v;
++		}
++		variance += squares - sum * sum / count;
++	}
++	return std::sqrt(variance / (count * (1 + (lastRow - firstRow) / step)));
++}
++
++std::optional<Measurement> match(const Calibration &cal, libcamera::Span<const uint8_t> frame)
++{
++	struct Sums { double a, b, aa, bb, ab; };
++	std::array<Sums, 2 * radius + 1> sums{};
++	unsigned int samples = 0;
++	for (int y = firstRow; y <= lastRow; y += step) {
++		std::array<double, count> a, b;
++		for (int i = 0; i < count; ++i) {
++			const int x = firstPair + i;
++			const unsigned int off = y * stride + 4 * x;
++			/* Use the nearest factory gain knot for each sampled pair. */
++			int knot = std::lround(12.0 * y / (height - 1)) * 17 +
++				   std::lround(16.0 * x / (width / 2 - 1));
++			if (!cal.left[knot] || !cal.right[knot])
++				return {};
++			a[i] = std::max<double>(sample(frame, off) - blackLevel, 0);
++			b[i] = std::max<double>(sample(frame, off + 2) - blackLevel, 0);
++			a[i] *= cal.left[knot];
++			b[i] *= cal.right[knot];
++		}
++		for (int d = -radius; d <= radius; ++d) {
++			auto &s = sums[d + radius];
++			for (int i = radius; i < count - radius; ++i) {
++				double l = a[i], r = b[i + d];
++				s.a += l;
++				s.b += r;
++				s.aa += l * l;
++				s.bb += r * r;
++				s.ab += l * r;
++			}
++		}
++		samples += count - 2 * radius;
++	}
++	std::array<double, sums.size()> corr;
++	for (unsigned int i = 0; i < corr.size(); ++i) {
++		const auto &s = sums[i];
++		double va = s.aa - s.a * s.a / samples;
++		double vb = s.bb - s.b * s.b / samples;
++		if (va <= 0 || vb <= 0)
++			return {};
++		corr[i] = (s.ab - s.a * s.b / samples) / std::sqrt(va * vb);
++	}
++	int peak = std::max_element(corr.begin(), corr.end()) - corr.begin();
++	if (!peak || peak == 2 * radius || corr[peak] < 0.8)
++		return {};
++	for (int i = 0; i <= 2 * radius; ++i)
++		if (std::abs(i - peak) > 1 && corr[i] >= corr[peak] - 0.025)
++			return {};
++	double curvature = 2 * corr[peak] - corr[peak - 1] - corr[peak + 1];
++	if (curvature <= 0)
++		return {};
++	double phase = peak - radius + 0.5 * (corr[peak + 1] - corr[peak - 1]) / curvature;
++	return Measurement{ phase, corr[peak], phase * cal.centreCoefficient() };
++}
++
++} /* namespace */
++
++std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
++			       const Calibration *cal,
++			       libcamera::Span<const uint8_t> previous)
++{
++	if (frame.size() != stride * height ||
++	    (!previous.empty() && previous.size() != frame.size()))
++		return {};
++
++	uint64_t sum = 0, squaredDifferences = 0;
++	for (size_t i = 0; i < frame.size(); i += 2) {
++		int v = sample(frame, i);
++		if (v > 1023)
++			return {};
++		sum += v;
++		if (!previous.empty()) {
++			int p = sample(previous, i);
++			if (p > 1023)
++				return {};
++			squaredDifferences += (v - p) * (v - p);
++		}
++	}
++	Analysis a{};
++	const double pixels = width * height;
++	a.mean = sum / pixels;
++	a.rmsLeft = windowContrast(frame, 0);
++	a.rmsRight = windowContrast(frame, 1);
++	if (!previous.empty())
++		a.temporalNoise = std::sqrt(squaredDifferences / (2 * pixels));
++	if (cal && a.textured())
++		a.phase = match(*cal, frame);
++	return a;
++}
++
++std::optional<int> focusTarget(int first, double firstError, int second, double secondError)
++{
++	if (first == second || firstError == secondError)
++		return {};
++	double target = second - secondError * (second - first) / (secondError - firstError);
++	if (!std::isfinite(target) || target < 0 || target > 1023)
++		return {};
++	return std::lround(target);
++}
++
++} /* namespace imx362 */
+diff --git a/src/apps/imx362-pdaf/pdaf.h b/src/apps/imx362-pdaf/pdaf.h
+new file mode 100644
+index 0000000..7252a9b
+--- /dev/null
++++ b/src/apps/imx362-pdaf/pdaf.h
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#pragma once
++
++#include <array>
++#include <cstdint>
++#include <optional>
++
++#include <libcamera/base/span.h>
++
++namespace imx362 {
++
++constexpr unsigned int width = 2016, height = 378;
++constexpr unsigned int stride = width * 2;
++
++struct Calibration {
++	std::array<uint16_t, 17 * 13> left, right;
++	std::array<uint16_t, 8 * 6> dcc;
++	unsigned int q;
++	int infinity, macro;
++
++	static std::optional<Calibration> read(libcamera::Span<const uint8_t> prefix,
++					       libcamera::Span<const uint8_t> af,
++					       libcamera::Span<const uint8_t> pd);
++	double centreCoefficient() const;
++};
++
++struct Measurement {
++	double phase; /* Positive when the second channel is displaced to the right. */
++	double correlation;
++	double defocus;
++};
++
++constexpr double blackLevel = 64;
++constexpr double dimMean = 80;
++
++struct Analysis {
++	double mean;
++	double rmsLeft, rmsRight; /* Horizontal contrast in the phase window, in RAW10 levels. */
++	std::optional<double> temporalNoise; /* RMS difference / sqrt(2) at fixed settings. */
++	std::optional<Measurement> phase;
++
++	bool textured() const { return rmsLeft >= 4 && rmsRight >= 4; }
++};
++
++std::optional<Analysis> analyse(libcamera::Span<const uint8_t> frame,
++			       const Calibration *cal = nullptr,
++			       libcamera::Span<const uint8_t> previous = {});
++std::optional<int> focusTarget(int first, double firstError, int second, double secondError);
++
++} /* namespace imx362 */
+diff --git a/src/apps/meson.build b/src/apps/meson.build
+index bd2f785..7ff0383 100644
+--- a/src/apps/meson.build
++++ b/src/apps/meson.build
+@@ -30,3 +30,7 @@ summary({
+         },
+         section : 'Applications',
+         bool_yn : true)
++
++if 'simple' in pipelines
++    subdir('imx362-pdaf')
++endif
+diff --git a/src/libcamera/v4l2_subdevice.cpp b/src/libcamera/v4l2_subdevice.cpp
+index a69de15..f479268 100644
+--- a/src/libcamera/v4l2_subdevice.cpp
++++ b/src/libcamera/v4l2_subdevice.cpp
+@@ -286,6 +286,13 @@ const std::map<uint32_t, MediaBusFormatInfo> mediaBusFormatInfo{
+ 		.bitsPerPixel = 10,
+ 		.colourEncoding = PixelFormatInfo::ColourEncodingYUV,
+ 	} },
++	{ MEDIA_BUS_FMT_Y10_2X8_PADHI_LE, {
++		.name = "Y10_2X8_PADHI_LE",
++		.code = MEDIA_BUS_FMT_Y10_2X8_PADHI_LE,
++		.type = MediaBusFormatInfo::Type::Image,
++		.bitsPerPixel = 10,
++		.colourEncoding = PixelFormatInfo::ColourEncodingYUV,
++	} },
+ 	{ MEDIA_BUS_FMT_UYVY10_2X10, {
+ 		.name = "UYVY10_2X10",
+ 		.code = MEDIA_BUS_FMT_UYVY10_2X10,
+diff --git a/test/imx362-pdaf.cpp b/test/imx362-pdaf.cpp
+new file mode 100644
+index 0000000..6ee4452
+--- /dev/null
++++ b/test/imx362-pdaf.cpp
+@@ -0,0 +1,168 @@
++// SPDX-License-Identifier: LGPL-2.1-or-later
++#include "../src/apps/imx362-pdaf/pdaf.h"
++
++#include <algorithm>
++#include <cmath>
++#include <iostream>
++#include <numeric>
++#include <random>
++#include <vector>
++
++#include <linux/media-bus-format.h>
++
++#include "libcamera/internal/v4l2_subdevice.h"
++
++using namespace imx362;
++
++namespace {
++
++void put(std::vector<uint8_t> &bytes, size_t at, unsigned int word)
++{
++	bytes[at] = word >> 8;
++	bytes[at + 1] = word;
++}
++
++void checkSum(std::vector<uint8_t> &bytes, size_t start, size_t end)
++{
++	put(bytes, end, std::accumulate(bytes.begin() + start, bytes.begin() + end, 0u));
++}
++
++std::vector<uint8_t> calibrationVector()
++{
++	std::vector<uint8_t> bytes(2900);
++	bytes[2] = 0x4c;
++	put(bytes, 0x758, 0xf610); /* -159 */
++	put(bytes, 0x75c, 0x0bb0); /* +187 */
++	checkSum(bytes, 0x758, 0x75e);
++	put(bytes, 0x766, 17);
++	put(bytes, 0x768, 13);
++	for (int i = 0; i < 221; ++i) {
++		put(bytes, 0x76a + 2 * i, 1000 + i);
++		put(bytes, 0x924 + 2 * i, 1200 - i);
++	}
++	put(bytes, 0xade, 3);
++	put(bytes, 0xae0, 8);
++	put(bytes, 0xae2, 6);
++	for (int i = 0; i < 48; ++i)
++		put(bytes, 0xae4 + 2 * i, (56 + i) * 16 + 15);
++	checkSum(bytes, 0x764, 0xb44);
++	return bytes;
++}
++
++std::optional<Calibration> parse(libcamera::Span<const uint8_t> bytes)
++{
++	return Calibration::read(bytes.first(2), bytes.subspan(0x758, 8), bytes.subspan(0x764, 0x3e4));
++}
++
++bool calibrationTest()
++{
++	auto bytes = calibrationVector();
++	for (int flip = 0; flip < 2; ++flip) {
++		auto cal = parse(bytes);
++		if (!cal || cal->infinity != -159 || cal->macro != 187 || cal->q != 3 ||
++		    cal->left.front() != 1220 || cal->right.back() != 1200 ||
++		    cal->dcc.front() != 103 || cal->dcc.back() != 56 ||
++		    cal->centreCoefficient() != 9)
++			return false;
++		for (size_t i = 0; i < bytes.size(); i += 4)
++			std::reverse(bytes.begin() + i, bytes.begin() + i + 4);
++	}
++	for (auto offset : { 0x758, 0x75f, 0x76a, 0xae4, 0xb45 }) {
++		bytes[offset] ^= 1;
++		if (parse(bytes))
++			return false;
++		bytes[offset] ^= 1;
++	}
++	put(bytes, 0xae0, 6);
++	checkSum(bytes, 0x764, 0xb44);
++	return !parse(bytes) && !Calibration::read({}, {}, {});
++}
++
++bool phaseTest()
++{
++	auto cal = *parse(calibrationVector());
++	/* Analytical translations of one non-periodic row. Unequal channel
++	 * gains and DC offsets must not change the sign or scale of disparity.
++	 */
++	std::array<int, width / 2 + 16> pattern;
++	std::mt19937 rng(1234);
++	for (int &v : pattern)
++		v = 80 + rng() % 250;
++	for (size_t i = 1; i + 1 < pattern.size(); ++i)
++		pattern[i] = (pattern[i - 1] + 2 * pattern[i] + pattern[i + 1]) / 4;
++	std::vector<uint8_t> frame(stride * height);
++	auto fill = [&](double d, bool periodic) {
++		for (unsigned int y = 0; y < height; ++y) {
++			for (unsigned int x = 0; x < width / 2; ++x) {
++				int i = x + 8;
++				int n = std::floor(i - d);
++				double frac = i - d - n;
++				int a = periodic ? 160 + (x % 4) * 16 : pattern[i];
++				int b = periodic ? a : std::lround(20 + 1.7 * ((1 - frac) * pattern[n] + frac * pattern[n + 1]));
++				unsigned int off = y * stride + x * 4;
++				frame[off] = a;
++				frame[off + 1] = a >> 8;
++				frame[off + 2] = b;
++				frame[off + 3] = b >> 8;
++			}
++		}
++	};
++	for (double expected : { -4.0, -1.5, 0.0, 2.5, 4.0 }) {
++		fill(expected, false);
++		auto a = analyse(frame, &cal);
++		if (!a || !a->phase || std::abs(a->phase->phase - expected) > 0.16 ||
++		    std::abs(a->phase->defocus - expected * 9) > 1.44)
++			return false;
++	}
++	fill(0, true);
++	auto a = analyse(frame, &cal);
++	return a && a->textured() && !a->phase;
++}
++
++bool statisticsTest()
++{
++	/* A 256/264 stripe in each channel has mean 260 and horizontal RMS 4.
++	 * A two-level inter-frame difference gives temporal RMS sqrt(2).
++	 */
++	std::vector<uint8_t> first(stride * height), second(first.size());
++	for (size_t offset = 0; offset < first.size(); offset += 2) {
++		first[offset] = offset & 4 ? 8 : 0;
++		first[offset + 1] = second[offset + 1] = 1;
++		second[offset] = first[offset] + 2;
++	}
++	auto a = analyse(second, nullptr, first);
++	if (!a || !a->textured() || a->mean != 262 || a->rmsLeft != 4 || a->rmsRight != 4 ||
++	    !a->temporalNoise || std::abs(*a->temporalNoise - std::sqrt(2.0)) > 1e-9)
++		return false;
++	std::fill(first.begin(), first.end(), 0);
++	a = analyse(first);
++	if (!a || a->textured() || a->mean != 0 || a->temporalNoise || a->phase ||
++	    analyse(libcamera::Span<const uint8_t>(first).first(12)))
++		return false;
++	first.back() = 4; /* Out-of-range word outside the focus window. */
++	return !analyse(first) && !analyse(second, nullptr, first);
++}
++
++} /* namespace */
++
++int main()
++{
++	const auto &info = libcamera::MediaBusFormatInfo::info(MEDIA_BUS_FMT_Y10_2X8_PADHI_LE);
++	if (info.code != MEDIA_BUS_FMT_Y10_2X8_PADHI_LE || info.bitsPerPixel != 10 ||
++	    info.colourEncoding != libcamera::PixelFormatInfo::ColourEncodingYUV || !statisticsTest()) {
++		std::cerr << "Y10 format or frame statistics failed\n";
++		return 1;
++	}
++	if (!calibrationTest()) {
++		std::cerr << "OTP calibration vector failed\n";
++		return 1;
++	}
++	if (!phaseTest()) {
++		std::cerr << "Phase translation or rejection vector failed\n";
++		return 1;
++	}
++	if (focusTarget(448, -4, 576, 4) != 512 || focusTarget(448, 4, 576, -4) != 512 ||
++	    focusTarget(448, 3, 576, 3) || focusTarget(448, 10, 576, 11))
++		return 1;
++	return 0;
++}
+diff --git a/test/meson.build b/test/meson.build
+index e445062..a600946 100644
+--- a/test/meson.build
++++ b/test/meson.build
+@@ -130,3 +130,10 @@ foreach test : internal_non_parallel_tests
+          is_parallel : false,
+          should_fail : test.get('should_fail', false))
+ endforeach
++
++if 'simple' in pipelines
++    imx362_pdaf_test = executable('imx362-pdaf-test',
++        ['imx362-pdaf.cpp', '../src/apps/imx362-pdaf/pdaf.cpp'],
++        dependencies : libcamera_private)
++    test('imx362-pdaf', imx362_pdaf_test)
++endif
