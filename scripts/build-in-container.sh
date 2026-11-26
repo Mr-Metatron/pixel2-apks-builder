@@ -42,10 +42,12 @@ install -m 644 /src/keys/build.postmarketos.org.rsa.pub /etc/apk/keys/
 apk update
 apk upgrade --available
 case "$(cat /etc/alpine-release)" in 3.24.*) ;; *) fail 'The container must resolve to Alpine 3.24.' ;; esac
-apk add alpine-sdk ccache jq tar binutils
+apk add alpine-sdk ccache jq tar binutils doas
 
 adduser -D -u "$BUILD_UID" ci-builder
 addgroup ci-builder abuild
+printf '%s\n' 'permit nopass :abuild as root cmd mkdir args -p /etc/apk/keys' \
+    'permit nopass :abuild as root cmd cp' > /etc/doas.conf
 export REPODEST=/work/repo
 export CCACHE_DIR=/ccache
 export CCACHE_BASEDIR=/work
