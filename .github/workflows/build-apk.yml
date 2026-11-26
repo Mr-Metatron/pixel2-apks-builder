@@ -37,6 +37,7 @@ jobs:
           persist-credentials: false
 
       - name: Validate inputs
+        id: inputs
         run: |
           [[ "$(uname -m)" == aarch64 ]]
           [[ "$BUILD_PACKAGES" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]]
@@ -51,12 +52,13 @@ jobs:
           epoch="${REQUESTED_EPOCH:-$(git show -s --format=%ct HEAD)}"
           [[ "$epoch" =~ ^(0|[1-9][0-9]*)$ ]]
           printf 'SOURCE_DATE_EPOCH=%s\n' "$epoch" >> "$GITHUB_ENV"
+          printf 'cache_group=%s\n' "${BUILD_PACKAGES//,/_}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-${{ runner.arch }}-${{ inputs.packages }}-${{ github.sha }}
-          restore-keys: ccache-${{ runner.arch }}-${{ inputs.packages }}-
+          key: ccache-${{ runner.arch }}-${{ steps.inputs.outputs.cache_group }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.arch }}-${{ steps.inputs.outputs.cache_group }}-
 
       - name: Build on native ARM64
         id: build

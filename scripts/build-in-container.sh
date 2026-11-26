@@ -49,6 +49,7 @@ addgroup ci-builder abuild
 printf '%s\n' 'permit nopass :abuild as root cmd mkdir args -p /etc/apk/keys' \
     'permit nopass :abuild as root cmd cp' > /etc/doas.conf
 export REPODEST=/work/repo
+export ABUILD_LAST_COMMIT="$BUILD_COMMIT"
 export CCACHE_DIR=/ccache
 export CCACHE_BASEDIR=/work
 export USE_CCACHE=1
